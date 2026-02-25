@@ -572,11 +572,14 @@ class PortfolioManager:
 
         st.markdown("### 📋 Holdings")
         dd = df.copy()
+        # Cast every display column to str so Arrow sees a uniform object-of-str
+        # dtype rather than a frame mixing float64, int64, and str columns.
+        dd["Qty"]           = dd["Qty"].apply(lambda v: f"{v:,.4g}")
         for col in ["Buy Price","Current Price","Cost Basis","Market Value"]:
-            dd[col] = dd[col].apply(lambda x: f"${x:,.2f}")
-        dd["P&L $"] = dd["P&L $"].apply(lambda x: f"${x:+,.2f}")
-        dd["P&L %"] = dd["P&L %"].apply(lambda x: f"{x:+.2f}%")
-        st.dataframe(dd,use_container_width=True,hide_index=True)
+            dd[col] = dd[col].apply(lambda v: f"${v:,.2f}")
+        dd["P&L $"] = dd["P&L $"].apply(lambda v: f"${v:+,.2f}")
+        dd["P&L %"] = dd["P&L %"].apply(lambda v: f"{v:+.2f}%")
+        st.dataframe(dd, use_container_width=True, hide_index=True)
 
         with st.expander("🗑️ Remove Position"):
             tl = [p["ticker"] for p in positions]
@@ -1529,11 +1532,30 @@ def render_backtest_tab(ticker: str) -> None:
     st.plotly_chart(fig_rsi, use_container_width=True)
 
     with st.expander(f"📋 Trade Log ({len(trades)} trades)"):
-        st.dataframe(trades, use_container_width=True, hide_index=True)
+        # trades_df columns: Entry/Exit Date (date objects), Entry/Exit Price (float),
+        # P&L % (float), Hold days (int), Exit Reason (str), Result (str).
+        # Mixed numeric + str columns → ArrowTypeError. Format everything to str.
+        display_trades = trades.copy()
+        display_trades["Entry Date"]  = display_trades["Entry Date"].astype(str)
+        display_trades["Exit Date"]   = display_trades["Exit Date"].astype(str)
+        display_trades["Entry Price"] = display_trades["Entry Price"].apply(lambda v: f"${v:,.2f}")
+        display_trades["Exit Price"]  = display_trades["Exit Price"].apply(lambda v: f"${v:,.2f}")
+        display_trades["P&L %"]       = display_trades["P&L %"].apply(lambda v: f"{v:+.2f}%")
+        display_trades["Hold (days)"] = display_trades["Hold (days)"].astype(str)
+        st.dataframe(display_trades, use_container_width=True, hide_index=True)
 
     with st.expander("📊 Full Metrics"):
-        st.dataframe(pd.DataFrame(list(metrics.items()), columns=["Metric", "Value"]),
-                     use_container_width=True, hide_index=True)
+        # metrics dict contains a mix of str values and one raw int (# Trades).
+        # Passing dict.items() directly to pd.DataFrame produces a "Value" column
+        # of object dtype with mixed types → ArrowTypeError on Streamlit Cloud.
+        # Cast every value to str to guarantee a uniform string column.
+        st.dataframe(
+            pd.DataFrame(
+                {"Metric": list(metrics.keys()),
+                 "Value":  [str(v) for v in metrics.values()]},
+            ),
+            use_container_width=True, hide_index=True,
+        )
 
     st.caption("⚠️ Past performance ≠ future results. No commissions, slippage, or taxes modelled.")
 

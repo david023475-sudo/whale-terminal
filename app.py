@@ -1454,57 +1454,80 @@ def page_analysis(run_analysis: bool) -> None:
                 "🧪 Adv. Backtest","🔮 Prediction Market",
             ])
 
+            # ── helper: build a clean ["Metric","Value"] frame with all-str columns ──
+            def _kv(pairs: list[tuple]) -> pd.DataFrame:
+                """
+                Accepts a list of (label, value) tuples and returns a two-column
+                DataFrame where BOTH columns are explicitly cast to str.
+                This prevents the ArrowTypeError that occurs when a 'Value' column
+                is inferred as object-dtype and contains mixed Python types.
+                """
+                return pd.DataFrame(
+                    {"Metric": [str(k) for k, _ in pairs],
+                     "Value":  [str(v) for _, v in pairs]}
+                )
+
             with t1:
                 ca,cb = st.columns(2)
                 with ca:
-                    st.table(pd.DataFrame({"Profit Margin":[fmt(info.get("profitMargins"),"percent")],
-                        "Operating Margin":[fmt(info.get("operatingMargins"),"percent")],
-                        "Gross Margin":[fmt(info.get("grossMargins"),"percent")],
-                        "ROE":[fmt(info.get("returnOnEquity"),"percent")],
-                        "ROA":[fmt(info.get("returnOnAssets"),"percent")]}.items(),columns=["Metric","Value"]))
+                    st.table(_kv([
+                        ("Profit Margin",   fmt(info.get("profitMargins"),   "percent")),
+                        ("Operating Margin",fmt(info.get("operatingMargins"),"percent")),
+                        ("Gross Margin",    fmt(info.get("grossMargins"),    "percent")),
+                        ("ROE",             fmt(info.get("returnOnEquity"),  "percent")),
+                        ("ROA",             fmt(info.get("returnOnAssets"),  "percent")),
+                    ]))
                 with cb:
-                    st.table(pd.DataFrame({"Revenue (TTM)":[fmt(info.get("totalRevenue"),"money")],
-                        "Net Income":[fmt(info.get("netIncomeToCommon"),"money")],
-                        "EBITDA":[fmt(info.get("ebitda"),"money")],
-                        "EPS (TTM)":[fmt(info.get("trailingEps"))],
-                        "EPS (Fwd)":[fmt(info.get("forwardEps"))]}.items(),columns=["Metric","Value"]))
+                    st.table(_kv([
+                        ("Revenue (TTM)", fmt(info.get("totalRevenue"),      "money")),
+                        ("Net Income",    fmt(info.get("netIncomeToCommon"), "money")),
+                        ("EBITDA",        fmt(info.get("ebitda"),            "money")),
+                        ("EPS (TTM)",     fmt(info.get("trailingEps"))),
+                        ("EPS (Fwd)",     fmt(info.get("forwardEps"))),
+                    ]))
 
             with t2:
                 ca,cb = st.columns(2)
                 with ca:
-                    st.table(pd.DataFrame({"Total Cash":[fmt(info.get("totalCash"),"money")],
-                        "Total Debt":[fmt(info.get("totalDebt"),"money")],
-                        "Quick Ratio":[fmt(info.get("quickRatio"))],
-                        "Current Ratio":[fmt(info.get("currentRatio"))]}.items(),columns=["Metric","Value"]))
+                    st.table(_kv([
+                        ("Total Cash",    fmt(info.get("totalCash"),    "money")),
+                        ("Total Debt",    fmt(info.get("totalDebt"),    "money")),
+                        ("Quick Ratio",   fmt(info.get("quickRatio"))),
+                        ("Current Ratio", fmt(info.get("currentRatio"))),
+                    ]))
                 with cb:
-                    st.table(pd.DataFrame({"Debt/Equity":[fmt(info.get("debtToEquity"))],
-                        "Free Cash Flow":[fmt(info.get("freeCashflow"),"money")],
-                        "Op. Cash Flow":[fmt(info.get("operatingCashflow"),"money")],
-                        "Book Value/Sh":[fmt(info.get("bookValue"))]}.items(),columns=["Metric","Value"]))
+                    st.table(_kv([
+                        ("Debt/Equity",   fmt(info.get("debtToEquity"))),
+                        ("Free Cash Flow",fmt(info.get("freeCashflow"),      "money")),
+                        ("Op. Cash Flow", fmt(info.get("operatingCashflow"), "money")),
+                        ("Book Value/Sh", fmt(info.get("bookValue"))),
+                    ]))
 
             with t3:
                 ca,cb = st.columns(2)
                 with ca:
-                    st.table(pd.DataFrame({"Rev Growth":[fmt(info.get("revenueGrowth"),"percent")],
-                        "EPS Growth":[fmt(info.get("earningsGrowth"),"percent")],
-                        "Rev/Share":[fmt(info.get("revenuePerShare"))],
-                        "Qtrly Rev Growth":[fmt(info.get("quarterlyRevenueGrowth"),"percent")]}.items(),
-                        columns=["Metric","Value"]))
+                    st.table(_kv([
+                        ("Rev Growth",       fmt(info.get("revenueGrowth"),          "percent")),
+                        ("EPS Growth",       fmt(info.get("earningsGrowth"),          "percent")),
+                        ("Rev/Share",        fmt(info.get("revenuePerShare"))),
+                        ("Qtrly Rev Growth", fmt(info.get("quarterlyRevenueGrowth"), "percent")),
+                    ]))
                 with cb:
                     st.info(f"**Sector:** {sector or 'N/A'}\n\n"
                             f"**Industry:** {industry or 'N/A'}\n\n"
                             f"**Source:** {src}")
 
             with t4:
-                st.table(pd.DataFrame({"P/E (TTM)":[fmt(info.get("trailingPE"))],
-                    "P/E (Fwd)":[fmt(info.get("forwardPE"))],
-                    "PEG Ratio":[fmt(info.get("pegRatio"))],
-                    "P/S":[fmt(info.get("priceToSalesTrailing12Months"))],
-                    "P/B":[fmt(info.get("priceToBook"))],
-                    "EV/EBITDA":[fmt(info.get("enterpriseToEbitda"))],
-                    "EV/Revenue":[fmt(info.get("enterpriseToRevenue"))],
-                    "1Y Target":[fmt(info.get("targetMeanPrice"))]}.items(),
-                    columns=["Metric","Value"]))
+                st.table(_kv([
+                    ("P/E (TTM)",  fmt(info.get("trailingPE"))),
+                    ("P/E (Fwd)",  fmt(info.get("forwardPE"))),
+                    ("PEG Ratio",  fmt(info.get("pegRatio"))),
+                    ("P/S",        fmt(info.get("priceToSalesTrailing12Months"))),
+                    ("P/B",        fmt(info.get("priceToBook"))),
+                    ("EV/EBITDA",  fmt(info.get("enterpriseToEbitda"))),
+                    ("EV/Revenue", fmt(info.get("enterpriseToRevenue"))),
+                    ("1Y Target",  fmt(info.get("targetMeanPrice"))),
+                ]))
 
             with t5:
                 st.markdown("### RSI Oversold + 200 SMA Basic Backtest")
@@ -1550,12 +1573,21 @@ def page_analysis(run_analysis: bool) -> None:
                         paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",
                         title="Equity Curve",yaxis_title="Value",xaxis_title="Trade #")
                     st.plotly_chart(feq,use_container_width=True)
-                    dt=btr["trades"].copy()
-                    dt["e"]=dt["e"].dt.strftime("%Y-%m-%d"); dt["x"]=dt["x"].dt.strftime("%Y-%m-%d")
-                    dt["r"]=dt["r"].apply(lambda x:f"{x:+.2f}%")
-                    st.dataframe(dt.rename(columns={"e":"Entry","x":"Exit","ep":"Entry $",
-                        "xp":"Exit $","r":"Return","hd":"Days"}),
-                        use_container_width=True,hide_index=True)
+                    dt = btr["trades"].copy()
+                    # Format every column to str before display.
+                    # Without this, "ep"/"xp" are float64, "hd" is int64, and "r"
+                    # is a formatted string — Arrow cannot serialise the mixed-type frame.
+                    dt["e"]  = dt["e"].dt.strftime("%Y-%m-%d")
+                    dt["x"]  = dt["x"].dt.strftime("%Y-%m-%d")
+                    dt["ep"] = dt["ep"].apply(lambda v: f"${v:,.2f}")
+                    dt["xp"] = dt["xp"].apply(lambda v: f"${v:,.2f}")
+                    dt["r"]  = dt["r"].apply(lambda v: f"{v:+.2f}%")
+                    dt["hd"] = dt["hd"].astype(str)
+                    st.dataframe(
+                        dt.rename(columns={"e":"Entry","x":"Exit","ep":"Entry $",
+                                           "xp":"Exit $","r":"Return","hd":"Days"}),
+                        use_container_width=True, hide_index=True,
+                    )
                 else: st.info("Insufficient data (need ≥252 trading days for backtest).")
 
             with t6:
