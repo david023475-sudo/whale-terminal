@@ -12,7 +12,6 @@ import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime
-import yfinance as yf
 
 # ─── Shared constants ─────────────────────────────────────────────────────────
 SECTOR_ETF_MAP = {
@@ -28,6 +27,85 @@ SECTOR_COLORS = {
     "Basic Materials":"#d2a8ff","Communication Services":"#63e6be",
 }
 FMP_BASE = "https://financialmodelingprep.com/api/v3"
+
+def _fmp_get(path: str, params: dict | None = None, api_key: str = "") -> list | dict | None:
+    """
+    Lightweight FMP helper used throughout this module.
+    `api_key` is passed in explicitly so modules stay testable without global state.
+    Falls back to the SUPABASE-adjacent pattern where the key comes from st.secrets.
+    """
+    key = api_key or ""
+    if not key:
+        try:
+            key = str(st.secrets.get("FMP_API_KEY", ""))
+        except Exception:
+            key = ""
+    if not key:
+        return None
+    try:
+        p = {"apikey": key}
+        if params:
+            p.update(params)
+        r = requests.get(f"{FMP_BASE}{path}", params=p, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fmp_price(ticker: str, api_key: str = "") -> tuple[float | None, float]:
+    """
+    Return (current_price, change_pct) for a single ticker via FMP /quote.
+    Used by watchlist and portfolio live-price lookups.
+    """
+    data = _fmp_get(f"/quote/{ticker}", api_key=api_key)
+    if data and isinstance(data, list) and data:
+        q = data[0]
+        price = q.get("price")
+        chg   = q.get("changesPercentage", 0.0)
+        return (float(price) if price is not None else None,
+                float(chg)   if chg   is not None else 0.0)
+    return None, 0.0
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fmp_history(ticker: str, period: str = "1y", interval: str = "1d",
+                 api_key: str = "") -> "pd.DataFrame":
+    """
+    Fetch OHLCV history from FMP — mirrors app.py's get_stock_history logic.
+    Used internally by portfolio benchmark and relative-strength calculations.
+    """
+    empty = pd.DataFrame()
+    if interval in ("5m","15m","30m","1h"):
+        data = _fmp_get(f"/historical-chart/{interval}/{ticker}", api_key=api_key)
+        if not data or not isinstance(data, list):
+            return empty
+        df = (pd.DataFrame(data)
+              .rename(columns={"date":"Date","open":"Open","high":"High",
+                                "low":"Low","close":"Close","volume":"Volume"}))
+        df["Date"] = pd.to_datetime(df["Date"])
+        return df.set_index("Date").sort_index()[["Open","High","Low","Close","Volume"]].dropna()
+
+    period_days = {"2d":2,"1mo":31,"3mo":92,"6mo":183,"1y":365,"2y":730,"5y":1825}
+    days = period_days.get(period, 365)
+    from_date = (datetime.now() - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
+    data = _fmp_get(f"/historical-price-full/{ticker}", {"from": from_date}, api_key=api_key)
+    if not data or not isinstance(data, dict):
+        return empty
+    hist = data.get("historical", [])
+    if not hist:
+        return empty
+    df = (pd.DataFrame(hist)
+          .rename(columns={"date":"Date","open":"Open","high":"High",
+                            "low":"Low","close":"Close","volume":"Volume"}))
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.set_index("Date").sort_index()
+    if interval == "1wk":
+        df = df.resample("W").agg(
+            {"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}
+        ).dropna()
+    return df[["Open","High","Low","Close","Volume"]].dropna()
 
 # Industry → known large-cap peer tickers (fallback when FMP unavailable)
 INDUSTRY_PEERS: dict[str, list[str]] = {
@@ -317,11 +395,9 @@ def render_watchlist_page(wm, user_id):
     for item in items:
         sym2 = item["ticker"]
         try:
-            h = _strip_tz(yf.Ticker(sym2).history(period="2d",interval="1d"))
-            price = float(h["Close"].iloc[-1]) if not h.empty else None
-            prev  = float(h["Close"].iloc[-2]) if len(h)>1 else price
-            chg   = ((price-prev)/prev*100) if (price and prev) else 0
-        except: price=None; chg=0
+            price, chg = _fmp_price(sym2)
+        except:
+            price = None; chg = 0.0
         alp = item.get("alert_price")
         c1,c2,c3,c4,c5 = st.columns([1.5,1.2,1.2,3,2])
         with c1: st.markdown(f"### {sym2}")
@@ -437,9 +513,10 @@ class PortfolioManager:
     @st.cache_data(ttl=300, show_spinner=False)
     def _live(ticker):
         try:
-            h = _strip_tz(yf.Ticker(ticker).history(period="2d",interval="1d"))
-            return float(h["Close"].iloc[-1]) if not h.empty else None
-        except: return None
+            price, _ = _fmp_price(ticker)
+            return price
+        except:
+            return None
 
     def enrich(self, positions):
         rows = []
@@ -457,9 +534,10 @@ class PortfolioManager:
     @st.cache_data(ttl=3600, show_spinner=False)
     def _hist_close(ticker, period="1y"):
         try:
-            h = _strip_tz(yf.Ticker(ticker).history(period=period,interval="1d"))
+            h = _fmp_history(ticker, period=period, interval="1d")
             return h["Close"] if not h.empty else None
-        except: return None
+        except:
+            return None
 
     def benchmark_chart(self, positions, period="1y"):
         if not positions: return None
@@ -647,15 +725,9 @@ def get_auto_peers(ticker: str, sector: str, industry: str, fmp_api_key: str = "
             raw = sector_map.get(sector or "", [])
             peers = [t for t in raw if t != ticker][:5]
 
-    # ── Strategy 3: yfinance info peers as ultimate fallback ─────────────────
+    # ── Strategy 3: index ETF fallback ───────────────────────────────────────
     if not peers:
-        try:
-            info = yf.Ticker(ticker).info
-            rec  = info.get("recommendationMean")  # not peers, but confirms data works
-            # Use ETF with same sector to infer peers from top holdings
-        except: pass
-        if not peers:
-            peers = ["SPY","QQQ","IWM","DIA","VTI"][:4]  # absolute fallback: indices
+        peers = ["SPY","QQQ","IWM","DIA","VTI"][:4]
 
     return peers[:5]
 
@@ -918,18 +990,26 @@ def calculate_dcf(
                 shares_outstanding = float(profile[0].get("sharesOutstanding", 0) or 0)
 
         if not fcf_history or not current_price or not shares_outstanding:
-            info = yf.Ticker(ticker).info
-            current_price        = current_price or float(info.get("currentPrice") or info.get("regularMarketPrice") or 0)
-            shares_outstanding   = shares_outstanding or float(info.get("sharesOutstanding") or 0)
-            total_debt           = total_debt or float(info.get("totalDebt") or 0)
-            cash_and_equivalents = cash_and_equivalents or float(info.get("totalCash") or 0)
-            if not fcf_history:
-                fcf   = info.get("freeCashflow")
-                op_cf = info.get("operatingCashflow")
-                if fcf:
-                    fcf_history = [float(fcf)]
-                elif op_cf:
-                    fcf_history = [float(op_cf) * 0.8]
+            # FMP supplemental — try income statement for any missing fields
+            if fmp_api_key:
+                try:
+                    inc = _fetch_fmp(f"{FMP_BASE}/income-statement/{ticker}",
+                                     {"apikey": fmp_api_key, "limit": 1})
+                    if inc and isinstance(inc, list) and inc:
+                        i0 = inc[0]
+                        if not fcf_history:
+                            op  = float(i0.get("operatingCashFlow") or 0)
+                            cap = float(i0.get("capitalExpenditure") or 0)
+                            if op:
+                                fcf_history = [op - abs(cap)]
+                        if not current_price:
+                            q = _fmp_get(f"/quote/{ticker}", api_key=fmp_api_key)
+                            if q and isinstance(q, list) and q:
+                                current_price = float(q[0].get("price") or 0)
+                        if not shares_outstanding:
+                            shares_outstanding = float(i0.get("weightedAverageShsOutDil") or 0)
+                except:
+                    pass
 
         if not fcf_history or not current_price or not shares_outstanding:
             return None
@@ -1133,11 +1213,10 @@ def render_dcf_tab(ticker: str, fmp_api_key: str = "") -> None:
 # =============================================================================
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _fetch_history_pct(ticker_symbol: str, period: str = "1y") -> pd.Series | None:
-    """Cumulative % return series, tz-stripped."""
+def _fetch_history_pct(ticker_symbol: str, period: str = "1y") -> "pd.Series | None":
+    """Cumulative % return series via FMP — no yfinance."""
     try:
-        df = yf.Ticker(ticker_symbol).history(period=period)
-        df = _strip_tz(df)                              # ← FIX timezone
+        df = _fmp_history(ticker_symbol, period=period, interval="1d")
         if df.empty:
             return None
         s = df["Close"].pct_change().fillna(0)
@@ -1270,11 +1349,10 @@ def render_relative_strength_tab(ticker: str, sector: str = "") -> None:
 # =============================================================================
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _load_backtest_data(ticker: str) -> pd.DataFrame:
-    """2-year daily OHLCV, tz-stripped."""
+def _load_backtest_data(ticker: str) -> "pd.DataFrame":
+    """2-year daily OHLCV via FMP — no yfinance."""
     try:
-        df = yf.Ticker(ticker).history(period="2y", interval="1d")
-        return _strip_tz(df)                            # ← FIX timezone
+        return _fmp_history(ticker, period="2y", interval="1d")
     except Exception:
         return pd.DataFrame()
 
