@@ -30,9 +30,11 @@ FMP_BASE = "https://financialmodelingprep.com/api/v3"
 
 def _fmp_get(path: str, params: dict | None = None, api_key: str = "") -> list | dict | None:
     """
-    Lightweight FMP helper used throughout this module.
-    `api_key` is passed in explicitly so modules stay testable without global state.
-    Falls back to the SUPABASE-adjacent pattern where the key comes from st.secrets.
+    Central FMP v3 helper for this module.
+    - Targets FMP_BASE (https://financialmodelingprep.com/api/v3)
+    - Reads API key from explicit arg → st.secrets → returns None if missing
+    - Detects {"Error Message": "..."} legacy-block responses and returns None
+      so callers never accidentally parse an error dict as real data
     """
     key = api_key or ""
     if not key:
@@ -48,8 +50,13 @@ def _fmp_get(path: str, params: dict | None = None, api_key: str = "") -> list |
             p.update(params)
         r = requests.get(f"{FMP_BASE}{path}", params=p, timeout=10)
         r.raise_for_status()
-        return r.json()
-    except Exception:
+        data = r.json()
+        if isinstance(data, dict) and "Error Message" in data:
+            print(f"[FMP blocked] {path}: {data['Error Message'][:140]}")
+            return None
+        return data
+    except Exception as exc:
+        print(f"[FMP error] {path}: {exc}")
         return None
 
 
@@ -683,27 +690,22 @@ def get_auto_peers(ticker: str, sector: str, industry: str, fmp_api_key: str = "
     ticker = ticker.upper().strip()
     peers: list[str] = []
 
-    # ── Strategy 1: FMP screener ──────────────────────────────────────────────
+    # ── Strategy 1: FMP screener (routed through _fmp_get for error guard) ─────
     if fmp_api_key and sector:
         try:
-            resp = requests.get(
-                f"{FMP_BASE}/stock-screener",
-                params={
-                    "sector":   sector,
-                    "exchange": "NASDAQ,NYSE,AMEX",
-                    "limit":    20,
-                    "apikey":   fmp_api_key,
-                },
-                timeout=8,
-            ).json()
+            resp = _fmp_get(
+                "/stock-screener",
+                {"sector": sector, "exchange": "NASDAQ,NYSE,AMEX", "limit": 20},
+                api_key=fmp_api_key,
+            )
             if isinstance(resp, list) and resp:
-                # sort by mktCap descending, exclude input ticker
                 sorted_stocks = sorted(
                     [s for s in resp if s.get("symbol","").upper() != ticker and s.get("mktCap")],
-                    key=lambda x: float(x.get("mktCap",0) or 0), reverse=True
+                    key=lambda x: float(x.get("mktCap", 0) or 0), reverse=True,
                 )
                 peers = [s["symbol"] for s in sorted_stocks[:5]]
-        except: pass
+        except:
+            pass
 
     # ── Strategy 2: curated industry table ───────────────────────────────────
     if not peers:
@@ -936,10 +938,21 @@ def render_polymarket_tab(ticker: str, sector: str = "") -> None:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _fetch_fmp(endpoint: str, params: dict) -> list | dict | None:
+    """
+    Legacy-safe FMP helper used by calculate_dcf.
+    Accepts full URLs (e.g. f"{FMP_BASE}/cash-flow-statement/{ticker}") for
+    backward compatibility, strips the base URL and delegates to _fmp_get so
+    the Error Message guard is always active.
+    """
     try:
-        r = requests.get(endpoint, params=params, timeout=10)
-        r.raise_for_status()
-        return r.json()
+        # Strip the base URL prefix so _fmp_get can prepend it correctly
+        path = endpoint
+        if path.startswith(FMP_BASE):
+            path = path[len(FMP_BASE):]
+        # Extract the apikey param to pass as api_key; remove from params dict
+        key = params.pop("apikey", "") if isinstance(params, dict) else ""
+        result = _fmp_get(path, params or None, api_key=key)
+        return result
     except Exception:
         return None
 
