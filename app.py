@@ -11,7 +11,6 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import os, json, requests
-import yfinance as yf
 from langchain_groq import ChatGroq
 
 from whale_terminal_modules import (
@@ -255,7 +254,7 @@ with st.sidebar:
     )
 
 # =============================================================================
-# SHARED DATA HELPERS
+# SHARED DATA HELPERS — FMP only, yfinance fully removed
 # =============================================================================
 RANGE_MAP = {
     "1D":{"period":"1d","interval":"5m"},  "5D":{"period":"5d","interval":"15m"},
@@ -263,62 +262,218 @@ RANGE_MAP = {
     "6M":{"period":"6mo","interval":"1d"}, "1Y":{"period":"1y","interval":"1d"},
     "2Y":{"period":"2y","interval":"1wk"}, "5Y":{"period":"5y","interval":"1wk"},
 }
+FMP_BASE_URL = "https://financialmodelingprep.com/api/v3"
 
-# ── Stock data ────────────────────────────────────────────────────────────────
+def _fmp_get(path: str, params: dict | None = None) -> list | dict | None:
+    """Central FMP request helper — injects API key, returns parsed JSON or None."""
+    if not FMP_API_KEY:
+        return None
+    try:
+        p = {"apikey": FMP_API_KEY}
+        if params:
+            p.update(params)
+        r = requests.get(f"{FMP_BASE_URL}{path}", params=p, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+# ── Stock info ────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=900, show_spinner=False)
 def get_stock_info(ticker: str) -> dict:
-    if FMP_API_KEY:
-        try:
-            r = requests.get(
-                f"https://financialmodelingprep.com/api/v3/profile/{ticker}",
-                params={"apikey":FMP_API_KEY}, timeout=8
-            ).json()
-            if r and isinstance(r,list):
-                p = r[0]
-                return {
-                    "symbol":p.get("symbol"),"longName":p.get("companyName"),
-                    "sector":p.get("sector"),"industry":p.get("industry"),
-                    "currentPrice":p.get("price"),"previousClose":p.get("price"),
-                    "marketCap":p.get("mktCap"),"forwardPE":p.get("pe"),
-                    "trailingPE":p.get("pe"),"pegRatio":p.get("peg"),
-                    "priceToSalesTrailing12Months":p.get("priceToSalesRatio"),
-                    "priceToBook":p.get("ptb"),
-                    "profitMargins":(p.get("netProfitMargin",0)/100) if p.get("netProfitMargin") else None,
-                    "operatingMargins":(p.get("operatingProfitMargin",0)/100) if p.get("operatingProfitMargin") else None,
-                    "grossMargins":p.get("grossProfitRatio"),
-                    "returnOnEquity":(p.get("roe",0)/100) if p.get("roe") else None,
-                    "returnOnAssets":(p.get("roa",0)/100) if p.get("roa") else None,
-                    "revenueGrowth":(p.get("revenueGrowth",0)/100) if p.get("revenueGrowth") else None,
-                    "earningsGrowth":(p.get("epsgrowth",0)/100) if p.get("epsgrowth") else None,
-                    "totalRevenue":p.get("revenue"),
-                    "freeCashflow":(p.get("freeCashFlowPerShare",0)*p.get("sharesOutstanding",1)) if p.get("freeCashFlowPerShare") else None,
-                    "totalDebt":p.get("totalDebt"),"totalCash":p.get("cash"),
-                    "debtToEquity":p.get("debtToEquity"),"beta":p.get("beta"),
-                    "trailingEps":p.get("eps"),"forwardEps":p.get("eps"),
-                    "targetMeanPrice":p.get("dcf"),"sharesOutstanding":p.get("sharesOutstanding"),
-                    "fiftyTwoWeekHigh":p.get("range","0-0").split("-")[-1] if p.get("range") else None,
-                    "fiftyTwoWeekLow":p.get("range","0-0").split("-")[0]  if p.get("range") else None,
-                    "volume":p.get("volAvg"),
-                    "quickRatio":None,"currentRatio":None,"ebitda":None,
-                    "netIncomeToCommon":None,"enterpriseToEbitda":None,
-                    "enterpriseToRevenue":None,"bookValue":None,"revenuePerShare":None,
-                    "operatingCashflow":None,"quarterlyRevenueGrowth":None,"_source":"FMP",
-                }
-        except: pass
-    info = yf.Ticker(ticker).info
-    info["_source"] = "yfinance"
-    return info
+    """
+    Fetch company profile + key metrics from FMP.
+    Merges /profile, /key-metrics-ttm, and /financial-growth
+    into a yfinance-compatible key dict so the rest of the UI needs no changes.
+    No yfinance fallback — FMP is the sole source.
+    """
+    if not FMP_API_KEY:
+        st.warning("⚠️ **FMP_API_KEY** not configured — stock data unavailable.")
+        return {}
+
+    profile_data = _fmp_get(f"/profile/{ticker}")
+    if not profile_data or not isinstance(profile_data, list):
+        st.error(f"❌ Could not fetch profile for **{ticker}**. Check the ticker symbol.")
+        return {}
+    p = profile_data[0]
+
+    # Key-metrics TTM gives richer ratios (P/E, P/B, EV/EBITDA, etc.)
+    km: dict = {}
+    km_data = _fmp_get(f"/key-metrics-ttm/{ticker}")
+    if km_data and isinstance(km_data, list) and km_data:
+        km = km_data[0]
+
+    # Financial-growth gives revenue/earnings growth rates
+    gr: dict = {}
+    gr_data = _fmp_get(f"/financial-growth/{ticker}", {"limit": 1})
+    if gr_data and isinstance(gr_data, list) and gr_data:
+        gr = gr_data[0]
+
+    # Parse "low-high" range string safely
+    wk52_high = wk52_low = None
+    for raw_range in [p.get("range", "") or ""]:
+        if "-" in raw_range:
+            parts = raw_range.split("-")
+            try:
+                wk52_low  = float(parts[0])
+                wk52_high = float(parts[-1])
+            except (ValueError, IndexError):
+                pass
+
+    def _f(v):
+        """Safe float or None."""
+        try: return float(v) if v is not None else None
+        except: return None
+
+    def _pct(v):
+        """FMP stores some margins as 0-100; convert to 0-1 decimals (yfinance convention)."""
+        try: return float(v) / 100 if v is not None else None
+        except: return None
+
+    return {
+        # ── Identity
+        "symbol":   p.get("symbol"),
+        "longName": p.get("companyName"),
+        "sector":   p.get("sector"),
+        "industry": p.get("industry"),
+        "longBusinessSummary": p.get("description", ""),
+        "website":  p.get("website", ""),
+        "country":  p.get("country", ""),
+        "fullTimeEmployees": _f(p.get("fullTimeEmployees")),
+        # ── Price
+        "currentPrice":  _f(p.get("price")),
+        "previousClose": _f(p.get("price")),   # FMP profile has no separate prev-close
+        "open":          _f(p.get("price")),
+        "volume":        _f(p.get("volAvg")),
+        "marketCap":     _f(p.get("mktCap")),
+        "beta":          _f(p.get("beta")),
+        "fiftyTwoWeekHigh": wk52_high,
+        "fiftyTwoWeekLow":  wk52_low,
+        # ── Valuation — key-metrics-ttm preferred over profile
+        "trailingPE":  _f(km.get("peRatioTTM")              or p.get("pe")),
+        "forwardPE":   _f(km.get("peRatioTTM")              or p.get("pe")),
+        "pegRatio":    _f(km.get("pegRatioTTM")             or p.get("peg")),
+        "priceToSalesTrailing12Months": _f(km.get("priceToSalesRatioTTM") or p.get("priceToSalesRatio")),
+        "priceToBook": _f(km.get("pbRatioTTM")              or p.get("ptb")),
+        "enterpriseToEbitda":  _f(km.get("enterpriseValueOverEBITDATTM")),
+        "enterpriseToRevenue": _f(km.get("evToSalesRatioTTM")),
+        # ── Earnings
+        "trailingEps":     _f(p.get("eps")),
+        "forwardEps":      _f(p.get("eps")),
+        "targetMeanPrice": _f(p.get("dcf")),   # FMP DCF fair value used as analyst target proxy
+        # ── Profitability (0-1 decimals, matching yfinance convention)
+        "profitMargins":    _pct(p.get("netProfitMargin")),
+        "operatingMargins": _pct(p.get("operatingProfitMargin")),
+        "grossMargins":     _f(p.get("grossProfitRatio")),   # already 0-1 in FMP
+        "returnOnEquity":   _pct(p.get("roe")),
+        "returnOnAssets":   _pct(p.get("roa")),
+        # ── Balance sheet
+        "totalDebt":    _f(p.get("totalDebt")),
+        "totalCash":    _f(p.get("cash")),
+        "debtToEquity": _f(p.get("debtToEquity")),
+        "quickRatio":   _f(km.get("quickRatioTTM")),
+        "currentRatio": _f(km.get("currentRatioTTM")),
+        "bookValue":    _f(km.get("bookValuePerShareTTM")),
+        # ── Cash flow
+        "freeCashflow": (
+            float(p.get("freeCashFlowPerShare") or 0) *
+            float(p.get("sharesOutstanding")    or 1)
+        ) if p.get("freeCashFlowPerShare") else None,
+        "operatingCashflow": None,  # not in profile; DCF tab fetches via statement endpoint
+        # ── Revenue / growth
+        "totalRevenue":    _f(p.get("revenue")),
+        "revenuePerShare": _f(km.get("revenuePerShareTTM")),
+        "revenueGrowth":   _f(gr.get("revenueGrowth")),   # already 0-1 decimal
+        "earningsGrowth":  _f(gr.get("netIncomeGrowth")),
+        "quarterlyRevenueGrowth": _f(gr.get("revenueGrowth")),
+        # ── Income (not in profile — populated by statement endpoints elsewhere)
+        "ebitda":            None,
+        "netIncomeToCommon": None,
+        # ── Shares
+        "sharesOutstanding": _f(p.get("sharesOutstanding")),
+        "_source": "FMP",
+    }
+
+
+# ── OHLCV history ─────────────────────────────────────────────────────────────
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_stock_history(ticker: str, period: str, interval: str) -> "pd.DataFrame":
+    """
+    Fetch OHLCV from FMP — no yfinance.
+    Intraday (5m/15m) → /historical-chart/{interval}/{ticker}
+    Daily/weekly      → /historical-price-full/{ticker}
+    Returns a tz-naive DataFrame with columns Open, High, Low, Close, Volume.
+    """
+    empty = pd.DataFrame()
+    if not FMP_API_KEY:
+        return empty
+
+    # ── Intraday ──────────────────────────────────────────────────────────────
+    if interval in ("5m","15m","30m","1h"):
+        data = _fmp_get(f"/historical-chart/{interval}/{ticker}")
+        if not data or not isinstance(data, list):
+            return empty
+        df = (pd.DataFrame(data)
+              .rename(columns={"date":"Date","open":"Open","high":"High",
+                                "low":"Low","close":"Close","volume":"Volume"}))
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df.set_index("Date").sort_index()
+        # Trim to the look-back window
+        cutoff = {"1d": 1, "5d": 5}.get(period, 1)
+        df = df[df.index >= df.index[-1] - pd.Timedelta(days=cutoff)]
+        return df[["Open","High","Low","Close","Volume"]].dropna()
+
+    # ── Daily / weekly ────────────────────────────────────────────────────────
+    period_days = {"1mo":31,"3mo":92,"6mo":183,"1y":365,"2y":730,"5y":1825}
+    days = period_days.get(period, 365)
+    from_date = (datetime.now() - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
+
+    data = _fmp_get(f"/historical-price-full/{ticker}", {"from": from_date})
+    if not data or not isinstance(data, dict):
+        return empty
+    hist_list = data.get("historical", [])
+    if not hist_list:
+        return empty
+
+    df = (pd.DataFrame(hist_list)
+          .rename(columns={"date":"Date","open":"Open","high":"High",
+                            "low":"Low","close":"Close","volume":"Volume"}))
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.set_index("Date").sort_index()
+
+    if interval == "1wk":
+        df = df.resample("W").agg(
+            {"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}
+        ).dropna()
+
+    return df[["Open","High","Low","Close","Volume"]].dropna()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fmp_quote_batch(tickers: tuple) -> dict[str, dict]:
+    """
+    Fetch real-time quote for one or more tickers via FMP /quote/{symbols}.
+    Returns {TICKER: quote_dict}. Uses tuple arg so it is hashable for cache.
+    """
+    if not FMP_API_KEY or not tickers:
+        return {}
+    symbols = ",".join(tickers)
+    data = _fmp_get(f"/quote/{symbols}")
+    if not data or not isinstance(data, list):
+        return {}
+    return {item["symbol"]: item for item in data if "symbol" in item}
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_stock_history(ticker, period, interval):
-    return _strip_tz(yf.Ticker(ticker).history(period=period, interval=interval))
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_spy_benchmark(period="1y"):
+def get_spy_benchmark(period: str = "1y") -> float:
+    """Return SPY cumulative % return over the given period using FMP history."""
     try:
-        spy = _strip_tz(yf.Ticker("SPY").history(period=period))
-        return ((spy["Close"].iloc[-1]/spy["Close"].iloc[0])-1)*100 if len(spy)>1 else 0.0
-    except: return 0.0
+        hist = get_stock_history("SPY", period, "1d")
+        if hist.empty or len(hist) < 2:
+            return 0.0
+        return ((hist["Close"].iloc[-1] / hist["Close"].iloc[0]) - 1) * 100
+    except:
+        return 0.0
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_earnings_date(ticker: str, fmp_api_key: str = "") -> dict | None:
@@ -362,54 +517,32 @@ def get_earnings_date(ticker: str, fmp_api_key: str = "") -> dict | None:
                                 }
         except: pass
 
-    # ── Strategy 2: yfinance calendar ────────────────────────────────────────
-    try:
-        cal = yf.Ticker(ticker).calendar
-        if cal is not None and not cal.empty:
-            # calendar is a DataFrame with dates as columns, "Earnings Date" as row
-            edate = None
-            if "Earnings Date" in cal.index:
-                dates = cal.loc["Earnings Date"].dropna()
-                if len(dates):
-                    edate = pd.to_datetime(dates.iloc[0]).date()
-            elif hasattr(cal, "columns") and len(cal.columns):
-                try:
-                    edate = pd.to_datetime(cal.columns[0]).date()
-                except: pass
-            if edate and edate >= today:
-                days_away = (edate - today).days
-                return {
-                    "date": edate.strftime("%b %d, %Y"),
-                    "date_raw": edate.strftime("%Y-%m-%d"),
-                    "days_away": days_away,
-                    "is_soon": days_away <= 14,
-                    "is_imminent": days_away <= 3,
-                    "eps_estimate": None,
-                    "time_of_day": "Unknown",
-                    "source": "yfinance",
-                }
-    except: pass
-
-    # ── Strategy 3: yfinance earnings_dates ──────────────────────────────────
-    try:
-        edates = yf.Ticker(ticker).earnings_dates
-        if edates is not None and not edates.empty:
-            future = edates[edates.index.normalize() >= pd.Timestamp(today)]
-            if not future.empty:
-                edate = future.index[-1].date()
-                days_away = (edate - today).days
-                if 0 <= days_away <= 120:
-                    return {
-                        "date": edate.strftime("%b %d, %Y"),
-                        "date_raw": edate.strftime("%Y-%m-%d"),
-                        "days_away": days_away,
-                        "is_soon": days_away <= 14,
-                        "is_imminent": days_away <= 3,
-                        "eps_estimate": None,
-                        "time_of_day": "Unknown",
-                        "source": "yfinance",
-                    }
-    except: pass
+    # ── Strategy 2: FMP historical earnings calendar (wider look-ahead) ──────
+    # The /earning_calendar endpoint uses a date range. If it returned nothing
+    # (e.g. ticker not found in that window), try the per-ticker history list.
+    if fmp_api_key:
+        try:
+            data = _fmp_get(f"/historical/earning_calendar/{ticker}")
+            if isinstance(data, list):
+                for item in data:
+                    edate_str = item.get("date", "")
+                    if not edate_str:
+                        continue
+                    edate     = datetime.strptime(edate_str[:10], "%Y-%m-%d").date()
+                    days_away = (edate - today).days
+                    if 0 <= days_away <= 120:
+                        return {
+                            "date":        edate.strftime("%b %d, %Y"),
+                            "date_raw":    edate_str[:10],
+                            "days_away":   days_away,
+                            "is_soon":     days_away <= 14,
+                            "is_imminent": days_away <= 3,
+                            "eps_estimate":item.get("epsEstimated"),
+                            "time_of_day": item.get("time", "Unknown") or "Unknown",
+                            "source": "FMP-history",
+                        }
+        except:
+            pass
 
     return None
 
@@ -633,25 +766,29 @@ def get_news_sentiment(ticker: str, company_name: str = "") -> list[dict]:
                     })
         except: pass
 
-    # Fallback: yfinance news (no timestamp precision, mark as non-breaking)
+    # Fallback: FMP stock news (replaces yfinance.news — no rate-limit risk)
     if not arts:
         try:
-            raw = yf.Ticker(ticker).news or []
-            for item in raw[:10]:
-                pt  = item.get("providerPublishTime", 0)
-                ds  = datetime.fromtimestamp(pt).strftime("%Y-%m-%d") if pt else "N/A"
-                hours_ago = (now_utc - datetime.utcfromtimestamp(pt)).total_seconds()/3600 if pt else None
-                can = item.get("canonicalUrl", {}); url = can.get("url","") if isinstance(can,dict) else ""
-                if not url: url = item.get("link","") or f"https://finance.yahoo.com/quote/{ticker}"
-                arts.append({
-                    "title":     item.get("title","Market Update"),
-                    "publisher": item.get("publisher",""),
-                    "link":      url,
-                    "published": ds,
-                    "hours_ago": hours_ago,
-                    "breaking":  hours_ago is not None and hours_ago < 12,
-                })
-        except: pass
+            news_data = _fmp_get("/stock_news", {"tickers": ticker, "limit": 10})
+            if news_data and isinstance(news_data, list):
+                for item in news_data[:10]:
+                    pub_raw   = item.get("publishedDate", "")
+                    hours_ago = None
+                    try:
+                        pub_dt    = datetime.strptime(pub_raw[:19], "%Y-%m-%dT%H:%M:%S")
+                        hours_ago = (now_utc - pub_dt).total_seconds() / 3600
+                    except:
+                        pass
+                    arts.append({
+                        "title":     item.get("title", "Market Update"),
+                        "publisher": item.get("site", ""),
+                        "link":      item.get("url", ""),
+                        "published": pub_raw[:10],
+                        "hours_ago": hours_ago,
+                        "breaking":  hours_ago is not None and hours_ago < 12,
+                    })
+        except:
+            pass
 
     # AI sentiment scoring
     enriched: list[dict] = []
@@ -679,23 +816,31 @@ def get_news_sentiment(ticker: str, company_name: str = "") -> list[dict]:
 # ── Beta / correlation ────────────────────────────────────────────────────────
 def compute_rolling_beta(hist, window=90):
     try:
-        spy = _strip_tz(yf.Ticker("SPY").history(period="1y"))["Close"].pct_change()
+        spy_hist = get_stock_history("SPY", "1y", "1d")
+        if spy_hist.empty:
+            return None
+        spy = spy_hist["Close"].pct_change()
         stk = hist["Close"].pct_change()
-        al  = pd.concat([stk.rename("s"),spy.rename("spy")],axis=1).dropna()
-        if len(al)<window: return None
-        return (al["s"].rolling(window).cov(al["spy"])/al["spy"].rolling(window).var()).dropna()
-    except: return None
+        al  = pd.concat([stk.rename("s"), spy.rename("spy")], axis=1).dropna()
+        if len(al) < window:
+            return None
+        return (al["s"].rolling(window).cov(al["spy"]) / al["spy"].rolling(window).var()).dropna()
+    except:
+        return None
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def compute_peer_corr(ticker, peers, period="1y"):
     try:
-        prices={}
-        for t in (ticker,)+tuple(peers):
-            h=_strip_tz(yf.Ticker(t).history(period=period))
-            if not h.empty: prices[t]=h["Close"]
-        if len(prices)<2: return None
+        prices = {}
+        for t in (ticker,) + tuple(peers):
+            h = get_stock_history(t, period, "1d")
+            if not h.empty:
+                prices[t] = h["Close"]
+        if len(prices) < 2:
+            return None
         return pd.DataFrame(prices).pct_change().dropna().corr()
-    except: return None
+    except:
+        return None
 
 # =============================================================================
 # AI AGENT — v8: Realistic Valuations + Breaking News + Earnings Context
@@ -970,16 +1115,17 @@ def page_home():
 
     TRENDING = ["NVDA","AAPL","MSFT","TSLA","META"]
     st.markdown("### 🔥 Trending Stocks")
+    # Fetch all 5 quotes in a single FMP batch request
+    trending_quotes = _fmp_quote_batch(tuple(TRENDING))
     cols = st.columns(len(TRENDING))
     for col, sym in zip(cols, TRENDING):
         with col:
             try:
-                h = _strip_tz(yf.Ticker(sym).history(period="2d",interval="1d"))
-                price = float(h["Close"].iloc[-1]) if not h.empty else 0
-                prev  = float(h["Close"].iloc[-2]) if len(h)>1 else price
-                chg   = (price-prev)/prev*100 if prev else 0
-                cc    = "#26a69a" if chg>=0 else "#ef5350"
-                cs    = f"+{chg:.2f}%" if chg>=0 else f"{chg:.2f}%"
+                q     = trending_quotes.get(sym, {})
+                price = float(q.get("price", 0) or 0)
+                chg   = float(q.get("changesPercentage", 0) or 0)
+                cc    = "#26a69a" if chg >= 0 else "#ef5350"
+                cs    = f"+{chg:.2f}%" if chg >= 0 else f"{chg:.2f}%"
                 st.markdown(f"""<div class="info-card" style="text-align:center;">
                   <div style="font-family:'JetBrains Mono',monospace;font-size:1.1rem;
                        font-weight:800;color:#f0f6fc;">{sym}</div>
@@ -1003,11 +1149,15 @@ def page_home():
     }
     returns = {}
     with st.spinner("Loading sector data…"):
+        etf_quotes = _fmp_quote_batch(tuple(SECTOR_ETFS.values()))
         for name, etf in SECTOR_ETFS.items():
             try:
-                h = _strip_tz(yf.Ticker(etf).history(period="2d",interval="1d"))
-                if len(h)>1: returns[name]=(h["Close"].iloc[-1]/h["Close"].iloc[-2]-1)*100
-            except: pass
+                q = etf_quotes.get(etf, {})
+                chg_pct = q.get("changesPercentage")
+                if chg_pct is not None:
+                    returns[name] = float(chg_pct)
+            except:
+                pass
     if returns:
         rets   = list(returns.values())
         names  = list(returns.keys())
@@ -1994,8 +2144,8 @@ ALTER TABLE portfolios ENABLE ROW LEVEL SECURITY;
 
     st.markdown("---")
     st.caption(
-        "Whale Terminal Elite v7.0 | Built with Streamlit · Plotly · yfinance · "
-        "FMP · Groq LLaMA 3.3 · Supabase · Polymarket"
+        "Whale Terminal Elite v8.0 | Built with Streamlit · Plotly · FMP · "
+        "Groq LLaMA 3.3 · Supabase · Polymarket"
     )
 
 
