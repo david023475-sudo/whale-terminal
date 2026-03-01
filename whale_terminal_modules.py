@@ -32,31 +32,65 @@ def _fmp_get(path: str, params: dict | None = None, api_key: str = "") -> list |
     """
     Central FMP v3 helper for this module.
 
-    • Targets FMP_BASE (https://financialmodelingprep.com/api/v3)
-    • Passes `apikey` as a URL query parameter — the only method FMP accepts
-    • Reads the key from: explicit arg → st.secrets → returns None if absent
+    • Base URL: https://financialmodelingprep.com/api/v3  (FMP_BASE constant)
+    • API key priority: explicit arg → st.secrets["FMP_API_KEY"] → env var → None
+    • Detects HTTP 403 "API Plan Restrictions" and surfaces via st.error
     • Detects {"Error Message": "..."} legacy-block responses (HTTP 200) and
-      returns None so callers never process an error dict as stock data
+      surfaces them via st.error so the operator can see the reason in the UI
+    • Returns None on any error so callers never process an error payload as data
     """
+    # ── Resolve API key ────────────────────────────────────────────────────────
     key = api_key or ""
     if not key:
         try:
-            key = str(st.secrets.get("FMP_API_KEY", ""))
-        except Exception:
-            key = ""
+            key = str(st.secrets["FMP_API_KEY"])
+        except (KeyError, FileNotFoundError, Exception):
+            pass
+    if not key:
+        key = os.environ.get("FMP_API_KEY", "")
     if not key:
         return None
+
+    # ── Build and fire request ─────────────────────────────────────────────────
     try:
         p = {"apikey": key}
         if params:
             p.update(params)
         r = requests.get(f"{FMP_BASE}{path}", params=p, timeout=10)
+
+        # ── HTTP-level errors ─────────────────────────────────────────────────
+        if r.status_code == 403:
+            print(f"[FMP 403] {path}")
+            st.error(
+                f"⛔ FMP API Plan Restriction (HTTP 403) for `{path}`. "
+                "Your account does not have access to this endpoint. "
+                "This typically means the endpoint requires a paid plan, "
+                "or your account was created after Aug 31 2025 and the endpoint "
+                "is legacy-blocked. Check https://financialmodelingprep.com/developer/docs/pricing"
+            )
+            return None
+
         r.raise_for_status()
         data = r.json()
+
+        # ── Application-level legacy / plan errors (HTTP 200 with error body) ─
         if isinstance(data, dict) and "Error Message" in data:
-            print(f"[FMP blocked] {path}: {data['Error Message'][:120]}")
+            msg = data["Error Message"]
+            print(f"[FMP blocked] {path}: {msg[:120]}")
+            st.error(
+                f"FMP API error for `{path}`: {msg[:250]}. "
+                "This usually means the endpoint is legacy-blocked for your account "
+                "or the API key has insufficient permissions."
+            )
             return None
+
         return data
+
+    except requests.exceptions.HTTPError as exc:
+        code = exc.response.status_code if exc.response is not None else "?"
+        print(f"[FMP HTTP {code}] {path}: {exc}")
+        st.error(f"FMP HTTP {code} error for `{path}`. Check your API key and subscription plan.")
+        return None
     except Exception as exc:
         print(f"[FMP error] {path}: {exc}")
         return None
