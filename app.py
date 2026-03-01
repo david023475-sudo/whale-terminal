@@ -267,11 +267,13 @@ FMP_BASE_URL = "https://financialmodelingprep.com/api/v3"
 def _fmp_get(path: str, params: dict | None = None) -> list | dict | None:
     """
     Central FMP v3 request helper.
-    - Always targets FMP_BASE_URL (https://financialmodelingprep.com/api/v3)
-    - Injects the API key automatically
-    - Returns None on any network error or non-200 status
-    - Detects the FMP legacy-block response {"Error Message": "..."} and returns
-      None so callers never accidentally parse an error dict as real stock data
+
+    • Always targets FMP_BASE_URL (https://financialmodelingprep.com/api/v3)
+    • Passes `apikey` as a URL query parameter — the only method FMP accepts
+    • Returns None (never raises) on any network or HTTP error
+    • Detects FMP legacy-block responses, which arrive as HTTP 200 with body
+      {"Error Message": "Legacy Endpoint: ..."} and silently returns None so
+      callers never accidentally process an error dict as real stock data
     """
     if not FMP_API_KEY:
         return None
@@ -282,10 +284,10 @@ def _fmp_get(path: str, params: dict | None = None) -> list | dict | None:
         r = requests.get(f"{FMP_BASE_URL}{path}", params=p, timeout=10)
         r.raise_for_status()
         data = r.json()
-        # FMP returns legacy-block and plan errors as HTTP 200 with a dict
-        # containing "Error Message" — detect and discard so callers get None
+        # FMP legacy / plan errors come back as HTTP 200 with an error dict.
+        # Catch them here so every caller sees None, not a broken dict.
         if isinstance(data, dict) and "Error Message" in data:
-            print(f"[FMP blocked] {path}: {data['Error Message'][:140]}")
+            print(f"[FMP blocked] {path}: {data['Error Message'][:120]}")
             return None
         return data
     except Exception as exc:
@@ -296,24 +298,24 @@ def _fmp_get(path: str, params: dict | None = None) -> list | dict | None:
 @st.cache_data(ttl=900, show_spinner=False)
 def get_stock_info(ticker: str) -> dict:
     """
-    Fetch full company fundamentals from FMP v3 non-legacy endpoints only.
+    Fetch full company fundamentals from FMP v3 — no legacy endpoints.
 
-    Endpoints used (all available to new accounts created after Aug 2025):
-      /api/v3/profile/{ticker}                — company overview, price, market cap
-      /api/v3/quote/{ticker}                  — real-time price, prev-close, volume,
-                                                day high/low, 52-wk range
-      /api/v3/ratios/{ticker}                 — P/E, P/B, P/S, EV/EBITDA, ROE, ROA,
-                                                profit/op/gross margins, D/E, quick/
-                                                current ratio, FCF per share
+    Endpoints used (all confirmed available to accounts created after Aug 2025):
+      /api/v3/profile/{ticker}                — overview, price, market cap, beta
+      /api/v3/quote/{ticker}                  — live price, previousClose, day
+                                                high/low, volume, 52-wk range
+      /api/v3/ratios/{ticker}                 — P/E, P/B, P/S, EV/EBITDA, margins,
+                                                ROE, ROA, D/E, quick/current ratio,
+                                                FCF per share  (period=annual)
       /api/v3/key-metrics/{ticker}            — book value/share, revenue/share,
-                                                EV/Revenue, PEG ratio
+                                                EV/Revenue, PEG ratio (period=annual)
       /api/v3/income-statement/{ticker}       — revenue, net income, EPS, EBITDA;
-                                                YoY growth computed from 2 periods
+                                                two rows used for YoY growth calc
       /api/v3/balance-sheet-statement/{ticker}— total debt, cash, shares outstanding
 
-    Removed legacy endpoints:
-      /key-metrics-ttm  → replaced by /ratios + /key-metrics (period=annual)
-      /financial-growth → replaced by computing YoY from two income statements
+    Removed (legacy-blocked for new accounts):
+      /key-metrics-ttm  → replaced by /ratios + /key-metrics  (period=annual)
+      /financial-growth → YoY growth now computed from two income-statement rows
     """
     if not FMP_API_KEY:
         st.warning("⚠️ **FMP_API_KEY** not configured — stock data unavailable.")
@@ -326,28 +328,28 @@ def get_stock_info(ticker: str) -> dict:
         return {}
     p = profile_data[0]
 
-    # ── 2. Real-time quote (prev-close, live price, day range) ────────────────
+    # ── 2. Real-time quote (freshest price + prev-close + day range) ──────────
     qt: dict = {}
     qt_data = _fmp_get(f"/quote/{ticker}")
     if qt_data and isinstance(qt_data, list) and qt_data:
         qt = qt_data[0]
 
-    # ── 3. Ratios — non-legacy, period=annual, most recent year ───────────────
-    #  Provides: P/E, P/B, P/S, EV/EBITDA, gross/op/net margins, ROE, ROA,
-    #  D/E, current ratio, quick ratio, FCF per share
+    # ── 3. Financial ratios — /ratios (non-legacy, period=annual) ─────────────
+    #    Provides: P/E, P/B, P/S, EV/EBITDA, gross/op/net margins, ROE, ROA,
+    #    D/E, current ratio, quick ratio, FCF per share — all as 0-1 decimals
     ra: dict = {}
     ra_data = _fmp_get(f"/ratios/{ticker}", {"period": "annual", "limit": 1})
     if ra_data and isinstance(ra_data, list) and ra_data:
         ra = ra_data[0]
 
-    # ── 4. Key-metrics — non-legacy, period=annual, most recent year ──────────
-    #  Provides: book value/share, revenue/share, EV/Revenue, PEG ratio
+    # ── 4. Key metrics — /key-metrics (non-legacy, period=annual) ─────────────
+    #    Provides: book value/share, revenue/share, EV/Revenue, PEG ratio
     km: dict = {}
     km_data = _fmp_get(f"/key-metrics/{ticker}", {"period": "annual", "limit": 1})
     if km_data and isinstance(km_data, list) and km_data:
         km = km_data[0]
 
-    # ── 5. Income statement (2 periods for YoY growth calculation) ───────────
+    # ── 5. Income statement — two periods to compute YoY growth ──────────────
     inc: dict = {}
     _rev_growth = _ni_growth = None
     inc_data = _fmp_get(f"/income-statement/{ticker}", {"period": "annual", "limit": 2})
@@ -361,27 +363,25 @@ def get_stock_info(ticker: str) -> dict:
             _rev_growth = (rev0 - rev1) / abs(rev1) if rev1 else None
             _ni_growth  = (ni0  - ni1)  / abs(ni1)  if ni1  else None
 
-    # ── 6. Balance sheet ──────────────────────────────────────────────────────
+    # ── 6. Balance sheet — debt, cash, shares ─────────────────────────────────
     bs: dict = {}
     bs_data = _fmp_get(f"/balance-sheet-statement/{ticker}", {"period": "annual", "limit": 1})
     if bs_data and isinstance(bs_data, list) and bs_data:
         bs = bs_data[0]
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    # ── Helpers ────────────────────────────────────────────────────────────────
     def _f(v):
         try: return float(v) if v is not None else None
         except: return None
 
-    def _r(v):
-        """Ratios endpoint already returns 0-1 decimals for margins/ROE/ROA."""
-        try: return float(v) if v is not None else None
-        except: return None
+    # /ratios already returns margins/ROE/ROA as 0-1 decimals — no conversion needed
+    _r = _f
 
-    # Live price prefers quote (fresher) over profile
-    live_price = _f(qt.get("price")) or _f(p.get("price"))
+    # Live price: quote is fresher than profile snapshot
+    live_price = _f(qt.get("price"))   or _f(p.get("price"))
     prev_close = _f(qt.get("previousClose")) or live_price
 
-    # 52-week range: prefer quote fields, fallback to profile "range" string
+    # 52-wk range: prefer quote fields, fall back to profile "low-high" string
     wk52_high = _f(qt.get("yearHigh"))
     wk52_low  = _f(qt.get("yearLow"))
     if not wk52_high:
@@ -404,7 +404,7 @@ def get_stock_info(ticker: str) -> dict:
         "website":  p.get("website", ""),
         "country":  p.get("country", ""),
         "fullTimeEmployees": _f(p.get("fullTimeEmployees")),
-        # ── Price (quote preferred — more current than profile snapshot)
+        # ── Price  (quote preferred — fresher than profile snapshot)
         "currentPrice":     live_price,
         "previousClose":    prev_close,
         "open":             _f(qt.get("open"))    or live_price,
@@ -415,7 +415,7 @@ def get_stock_info(ticker: str) -> dict:
         "beta":             _f(p.get("beta")),
         "fiftyTwoWeekHigh": wk52_high,
         "fiftyTwoWeekLow":  wk52_low,
-        # ── Valuation (/ratios non-legacy, /key-metrics non-legacy)
+        # ── Valuation  (/ratios and /key-metrics — both non-legacy)
         "trailingPE":  _r(ra.get("priceEarningsRatioTTM") or ra.get("priceEarningsRatio")),
         "forwardPE":   _r(ra.get("priceEarningsRatioTTM") or ra.get("priceEarningsRatio")),
         "pegRatio":    _r(km.get("pegRatio")),
@@ -427,28 +427,27 @@ def get_stock_info(ticker: str) -> dict:
         "trailingEps":     _f(inc.get("epsdiluted") or p.get("eps")),
         "forwardEps":      _f(inc.get("epsdiluted") or p.get("eps")),
         "targetMeanPrice": _f(p.get("dcf")),
-        # ── Profitability (/ratios returns these as 0-1 decimals already)
-        "profitMargins":    _r(ra.get("netProfitMarginTTM")      or ra.get("netProfitMargin")),
+        # ── Profitability  (/ratios returns these as 0-1 decimals already)
+        "profitMargins":    _r(ra.get("netProfitMarginTTM")       or ra.get("netProfitMargin")),
         "operatingMargins": _r(ra.get("operatingProfitMarginTTM") or ra.get("operatingProfitMargin")),
-        "grossMargins":     _r(ra.get("grossProfitMarginTTM")    or ra.get("grossProfitMargin")),
-        "returnOnEquity":   _r(ra.get("returnOnEquityTTM")       or ra.get("returnOnEquity")),
-        "returnOnAssets":   _r(ra.get("returnOnAssetsTTM")       or ra.get("returnOnAssets")),
+        "grossMargins":     _r(ra.get("grossProfitMarginTTM")     or ra.get("grossProfitMargin")),
+        "returnOnEquity":   _r(ra.get("returnOnEquityTTM")        or ra.get("returnOnEquity")),
+        "returnOnAssets":   _r(ra.get("returnOnAssetsTTM")        or ra.get("returnOnAssets")),
         # ── Balance sheet
-        "totalDebt":    _f(bs.get("totalDebt")                or p.get("totalDebt")),
-        "totalCash":    _f(bs.get("cashAndCashEquivalents")   or p.get("cash")),
-        "debtToEquity": _r(ra.get("debtEquityRatioTTM")       or ra.get("debtEquityRatio")),
-        "quickRatio":   _r(ra.get("quickRatioTTM")            or ra.get("quickRatio")),
-        "currentRatio": _r(ra.get("currentRatioTTM")          or ra.get("currentRatio")),
+        "totalDebt":    _f(bs.get("totalDebt")              or p.get("totalDebt")),
+        "totalCash":    _f(bs.get("cashAndCashEquivalents") or p.get("cash")),
+        "debtToEquity": _r(ra.get("debtEquityRatioTTM")     or ra.get("debtEquityRatio")),
+        "quickRatio":   _r(ra.get("quickRatioTTM")          or ra.get("quickRatio")),
+        "currentRatio": _r(ra.get("currentRatioTTM")        or ra.get("currentRatio")),
         "bookValue":    _f(km.get("bookValuePerShare")),
         # ── Cash flow
         "freeCashflow": (
-            _f(ra.get("freeCashFlowPerShareTTM") or ra.get("freeCashFlowPerShare") or 0) or 0
-        ) * (
-            _f(bs.get("commonStock") or p.get("sharesOutstanding") or 1) or 1
+            (_f(ra.get("freeCashFlowPerShareTTM") or ra.get("freeCashFlowPerShare")) or 0) *
+            (_f(bs.get("commonStock") or p.get("sharesOutstanding")) or 1)
         ) if (ra.get("freeCashFlowPerShareTTM") or ra.get("freeCashFlowPerShare")) else None,
         "operatingCashflow": _f(inc.get("operatingCashFlow")),
-        # ── Revenue / growth (YoY computed from two income statements)
-        "totalRevenue":    _f(inc.get("revenue")   or p.get("revenue")),
+        # ── Revenue / growth  (YoY computed from two income-statement rows)
+        "totalRevenue":    _f(inc.get("revenue")    or p.get("revenue")),
         "ebitda":          _f(inc.get("ebitda")),
         "netIncomeToCommon": _f(inc.get("netIncome")),
         "revenuePerShare": _f(km.get("revenuePerShare")),
@@ -542,20 +541,29 @@ def get_spy_benchmark(period: str = "1y") -> float:
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_earnings_date(ticker: str, fmp_api_key: str = "") -> dict | None:
     """
-    Fetch the next earnings announcement date from FMP v3.
-    Two strategies, both routing through _fmp_get so the Error Message guard
-    applies and raw requests.get is never called directly.
+    Fetch the next upcoming earnings date for `ticker` from FMP v3.
 
-    Strategy 1: /earning_calendar with from/to date range (finds upcoming events
-                across all tickers, filter for ours) — broadest coverage
-    Strategy 2: /earning_calendar/{ticker} per-ticker endpoint — narrower but
-                works when the date-range calendar misses the stock
+    Both strategies now route through _fmp_get so the "Error Message" guard
+    is always active — no raw requests.get calls.
 
-    Removed: /historical/earning_calendar/{ticker} — legacy-blocked.
+    Strategy 1: /earning_calendar?from=...&to=...
+        Date-range calendar across all tickers; filter by symbol.
+        Covers the next 90 days and is the most reliable source.
+
+    Strategy 2: /earning_calendar/{ticker}
+        Per-ticker endpoint (non-legacy v3). Used when strategy 1 returns
+        nothing for this ticker (e.g. event just outside the 90-day window).
+        Replaces the old /historical/earning_calendar/{ticker} which is
+        legacy-blocked for accounts created after Aug 31 2025.
+
+    Returns None if no upcoming event is found within 120 days.
     """
+    if not FMP_API_KEY:
+        return None
     today = datetime.now().date()
 
-    def _parse_item(item: dict) -> dict | None:
+    def _parse(item: dict) -> dict | None:
+        """Parse one earnings-calendar item; return result dict or None."""
         edate_str = item.get("date", "")
         if not edate_str:
             return None
@@ -572,18 +580,12 @@ def get_earnings_date(ticker: str, fmp_api_key: str = "") -> dict | None:
             "days_away":   days_away,
             "is_soon":     days_away <= 14,
             "is_imminent": days_away <= 3,
-            "eps_estimate":item.get("epsEstimated"),
-            "time_of_day": item.get("time", "Unknown") or "Unknown",
+            "eps_estimate": item.get("epsEstimated"),
+            "time_of_day":  item.get("time", "Unknown") or "Unknown",
             "source": "FMP",
         }
 
-    if not FMP_API_KEY:
-        return None
-
-    # ── Strategy 1: date-range earnings calendar ─────────────────────────────
-    # /earning_calendar?from=YYYY-MM-DD&to=YYYY-MM-DD returns all companies in
-    # that window — we filter for our ticker. Routes through _fmp_get so the
-    # "Error Message" guard is active.
+    # ── Strategy 1: date-range earnings calendar ──────────────────────────────
     try:
         from_d = today.strftime("%Y-%m-%d")
         to_d   = (today + pd.Timedelta(days=90)).strftime("%Y-%m-%d")
@@ -591,19 +593,20 @@ def get_earnings_date(ticker: str, fmp_api_key: str = "") -> dict | None:
         if isinstance(cal, list):
             for item in cal:
                 if str(item.get("symbol", "")).upper() == ticker.upper():
-                    result = _parse_item(item)
+                    result = _parse(item)
                     if result:
                         return result
     except Exception:
         pass
 
-    # ── Strategy 2: per-ticker earnings calendar ─────────────────────────────
-    # /earning_calendar/{ticker} — confirmed non-legacy v3 endpoint
+    # ── Strategy 2: per-ticker earnings calendar  ─────────────────────────────
+    # /earning_calendar/{ticker} — confirmed non-legacy v3 endpoint.
+    # Replaces deprecated /historical/earning_calendar/{ticker}.
     try:
         per_ticker = _fmp_get(f"/earning_calendar/{ticker}")
         if isinstance(per_ticker, list):
             for item in sorted(per_ticker, key=lambda x: x.get("date", "")):
-                result = _parse_item(item)
+                result = _parse(item)
                 if result and result["days_away"] <= 120:
                     return result
     except Exception:
@@ -1167,7 +1170,7 @@ def page_home():
     )
     col_s, col_b = st.columns([4,1])
     with col_s:
-        search = st.text_input("", placeholder="🔍  Search ticker — e.g. AAPL, TSLA, NVDA…",
+        search = st.text_input("Search", placeholder="🔍  Search ticker — e.g. AAPL, TSLA, NVDA…",
                                label_visibility="collapsed", key="home_search")
     with col_b:
         if st.button("Analyse →", type="primary", use_container_width=True, key="home_go"):
