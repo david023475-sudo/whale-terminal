@@ -352,7 +352,17 @@ def _fmp_get(path: str, params: dict | None = None,
         code = exc.response.status_code
         body = exc.response.text[:200]
         print(f"[FMP HTTP {code}] {path}: {exc}")
-        st.error(f"FMP HTTP {code} error for `{path}`. Response: {body}")
+        if code == 403:
+            st.error(
+                f"⛔ FMP API Plan Restriction (HTTP 403) for `{path}`. "
+                "Your account does not have access to this endpoint. "
+                "This typically means the endpoint requires a paid plan, "
+                "or your account was created after Aug 31 2025 and the endpoint "
+                "is legacy-blocked. Check your FMP subscription at "
+                "https://financialmodelingprep.com/developer/docs/pricing"
+            )
+        else:
+            st.error(f"FMP HTTP {code} error for `{path}`. Response: {body}")
         return None
     except requests.exceptions.ConnectionError:
         print(f"[FMP connection error] {path}")
@@ -587,16 +597,30 @@ def get_stock_history(ticker: str, period: str, interval: str) -> "pd.DataFrame"
 @st.cache_data(ttl=300, show_spinner=False)
 def _fmp_quote_batch(tickers: tuple) -> dict[str, dict]:
     """
-    Fetch real-time quote for one or more tickers via FMP /quote/{symbols}.
-    Returns {TICKER: quote_dict}. Uses tuple arg so it is hashable for cache.
+    Fetch real-time quotes for one or more tickers via FMP /api/v3/quote/{ticker}.
+
+    NOTE: The comma-separated batch endpoint (/quote/AAPL,MSFT,NVDA) is a legacy
+    endpoint blocked for FMP accounts created after Aug 31 2025 (HTTP 403 or
+    "Legacy Endpoint" error message).  This implementation calls /quote/{ticker}
+    individually for each symbol in a simple loop and merges results into a single
+    dict keyed by ticker symbol.  The cache TTL (5 min) amortises the extra calls.
+
+    Args:
+        tickers: Hashable tuple of uppercase ticker strings, e.g. ("AAPL","MSFT")
+
+    Returns:
+        {SYMBOL: quote_dict, ...} — empty dict if API key is absent or all calls fail
     """
     if not FMP_API_KEY or not tickers:
         return {}
-    symbols = ",".join(tickers)
-    data = _fmp_get(f"/quote/{symbols}")
-    if not data or not isinstance(data, list):
-        return {}
-    return {item["symbol"]: item for item in data if "symbol" in item}
+    result: dict[str, dict] = {}
+    for sym in tickers:
+        data = _fmp_get(f"/quote/{sym}")
+        if data and isinstance(data, list) and data:
+            item = data[0]
+            if "symbol" in item:
+                result[item["symbol"]] = item
+    return result
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -2090,10 +2114,13 @@ def page_news():
     )
     c1, c2 = st.columns([4,1])
     with c1:
-        query_input = st.text_input("Search topic",
+        query_input = st.text_input(
+            "Search topic",
             value="stock market finance economy Fed interest rates",
             placeholder="e.g. Fed rate cut, tech earnings, oil market",
-            help="Keywords to search. Try specific topics like 'NVDA AI chips'")
+            label_visibility="collapsed",
+            help="Keywords to search. Try specific topics like 'NVDA AI chips'",
+        )
     with c2:
         fetch_btn = st.button("🔄 Fetch", type="primary",
                               use_container_width=True, key="news_fetch")
