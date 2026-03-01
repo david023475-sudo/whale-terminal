@@ -31,10 +31,12 @@ FMP_BASE = "https://financialmodelingprep.com/api/v3"
 def _fmp_get(path: str, params: dict | None = None, api_key: str = "") -> list | dict | None:
     """
     Central FMP v3 helper for this module.
-    - Targets FMP_BASE (https://financialmodelingprep.com/api/v3)
-    - Reads API key from explicit arg → st.secrets → returns None if missing
-    - Detects {"Error Message": "..."} legacy-block responses and returns None
-      so callers never accidentally parse an error dict as real data
+
+    • Targets FMP_BASE (https://financialmodelingprep.com/api/v3)
+    • Passes `apikey` as a URL query parameter — the only method FMP accepts
+    • Reads the key from: explicit arg → st.secrets → returns None if absent
+    • Detects {"Error Message": "..."} legacy-block responses (HTTP 200) and
+      returns None so callers never process an error dict as stock data
     """
     key = api_key or ""
     if not key:
@@ -52,7 +54,7 @@ def _fmp_get(path: str, params: dict | None = None, api_key: str = "") -> list |
         r.raise_for_status()
         data = r.json()
         if isinstance(data, dict) and "Error Message" in data:
-            print(f"[FMP blocked] {path}: {data['Error Message'][:140]}")
+            print(f"[FMP blocked] {path}: {data['Error Message'][:120]}")
             return None
         return data
     except Exception as exc:
@@ -590,11 +592,11 @@ class PortfolioManager:
                     sector = ns
                     if sector == "Unknown" and fmp_api_key:
                         try:
-                            pr = requests.get(f"{FMP_BASE}/profile/{nt}",
-                                params={"apikey":fmp_api_key},timeout=6).json()
-                            if pr and isinstance(pr,list):
-                                sector = pr[0].get("sector","Unknown") or "Unknown"
-                        except: pass
+                            pr = _fmp_get(f"/profile/{nt}", api_key=fmp_api_key)
+                            if pr and isinstance(pr, list):
+                                sector = pr[0].get("sector", "Unknown") or "Unknown"
+                        except:
+                            pass
                     self.add_position(user_id, nt, np_, nq, sector)
                     st.success(f"✅ {nt} saved."); st.rerun()
                 else: st.warning("Enter a ticker.")
@@ -690,7 +692,7 @@ def get_auto_peers(ticker: str, sector: str, industry: str, fmp_api_key: str = "
     ticker = ticker.upper().strip()
     peers: list[str] = []
 
-    # ── Strategy 1: FMP screener (routed through _fmp_get for error guard) ─────
+    # ── Strategy 1: FMP screener (through _fmp_get — error guard active) ──────
     if fmp_api_key and sector:
         try:
             resp = _fmp_get(
@@ -939,20 +941,19 @@ def render_polymarket_tab(ticker: str, sector: str = "") -> None:
 @st.cache_data(ttl=3600, show_spinner=False)
 def _fetch_fmp(endpoint: str, params: dict) -> list | dict | None:
     """
-    Legacy-safe FMP helper used by calculate_dcf.
-    Accepts full URLs (e.g. f"{FMP_BASE}/cash-flow-statement/{ticker}") for
-    backward compatibility, strips the base URL and delegates to _fmp_get so
-    the Error Message guard is always active.
+    DCF-facing FMP helper. Accepts full URLs (f"{FMP_BASE}/cash-flow-statement/...")
+    for backward-compatibility, strips the base prefix and delegates to _fmp_get
+    so the "Error Message" legacy-block guard is always active.
+    `apikey` is extracted from params and passed via _fmp_get, which injects it
+    as a URL query parameter — the only method FMP honours.
     """
     try:
-        # Strip the base URL prefix so _fmp_get can prepend it correctly
         path = endpoint
         if path.startswith(FMP_BASE):
             path = path[len(FMP_BASE):]
-        # Extract the apikey param to pass as api_key; remove from params dict
-        key = params.pop("apikey", "") if isinstance(params, dict) else ""
-        result = _fmp_get(path, params or None, api_key=key)
-        return result
+        p = dict(params) if params else {}
+        key = p.pop("apikey", "")
+        return _fmp_get(path, p or None, api_key=key)
     except Exception:
         return None
 
