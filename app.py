@@ -116,20 +116,50 @@ hr { border:none; height:1px;
 </style>""", unsafe_allow_html=True)
 
 # ===================== CONFIG — secrets via st.secrets =======================
-# Helper: st.secrets first, os.environ second, empty string default
+# ─────────────────────────────────────────────────────────────────────────────
+# HARDCODED FALLBACKS — edit these if st.secrets is not loading correctly.
+# These are only used when st.secrets and environment variables both return
+# empty strings (e.g. during local dev without a secrets.toml, or if Streamlit
+# Cloud fails to inject secrets). Remove or blank them out for production.
+# ─────────────────────────────────────────────────────────────────────────────
+_FALLBACK_FMP_API_KEY    = "a"
+_FALLBACK_SUPABASE_URL   = "a"
+_FALLBACK_SUPABASE_KEY   = "a"
+_FALLBACK_GROQ_API_KEY   = "a"
+_FALLBACK_NEWS_API_KEY   = "a"
+_FALLBACK_ALPACA_KEY     = ""   # not configured yet
+_FALLBACK_ALPACA_SECRET  = ""   # not configured yet
+
+_FALLBACKS: dict[str, str] = {
+    "FMP_API_KEY":    _FALLBACK_FMP_API_KEY,
+    "SUPABASE_URL":   _FALLBACK_SUPABASE_URL,
+    "SUPABASE_ANON_KEY": _FALLBACK_SUPABASE_KEY,
+    "GROQ_API_KEY":   _FALLBACK_GROQ_API_KEY,
+    "NEWS_API_KEY":   _FALLBACK_NEWS_API_KEY,
+    "ALPACA_KEY":     _FALLBACK_ALPACA_KEY,
+    "ALPACA_SECRET":  _FALLBACK_ALPACA_SECRET,
+}
+
+# Helper: st.secrets first, os.environ second, hardcoded fallback third
 def _secret(key: str, default: str = "") -> str:
     """
     Priority:
       1. st.secrets[key]   — Streamlit Cloud / .streamlit/secrets.toml
       2. os.environ[key]   — Docker / local env vars
-      3. default           — empty string (feature degrades gracefully)
+      3. _FALLBACKS[key]   — hardcoded values above (last resort)
+      4. default           — empty string (feature degrades gracefully)
     Never raises; missing secrets disable features without crashing.
     """
     try:
-        return str(st.secrets[key])
-    except (KeyError, FileNotFoundError):
+        v = str(st.secrets[key])
+        if v:
+            return v
+    except (KeyError, FileNotFoundError, Exception):
         pass
-    return os.environ.get(key, default)
+    env_val = os.environ.get(key, "")
+    if env_val:
+        return env_val
+    return _FALLBACKS.get(key, default)
 
 GROQ_API_KEY  = _secret("GROQ_API_KEY")
 FMP_API_KEY   = _secret("FMP_API_KEY")
@@ -264,36 +294,78 @@ RANGE_MAP = {
 }
 FMP_BASE_URL = "https://financialmodelingprep.com/api/v3"
 
-def _fmp_get(path: str, params: dict | None = None) -> list | dict | None:
+def _fmp_get(path: str, params: dict | None = None,
+             _ui_errors: bool = False) -> list | dict | None:
     """
     Central FMP v3 request helper.
 
-    • Always targets FMP_BASE_URL (https://financialmodelingprep.com/api/v3)
-    • Passes `apikey` as a URL query parameter — the only method FMP accepts
-    • Returns None (never raises) on any network or HTTP error
-    • Detects FMP legacy-block responses, which arrive as HTTP 200 with body
-      {"Error Message": "Legacy Endpoint: ..."} and silently returns None so
-      callers never accidentally process an error dict as real stock data
+    - Always targets FMP_BASE_URL (https://financialmodelingprep.com/api/v3)
+    - Passes `apikey` as a URL query parameter — the only method FMP accepts
+    - Returns None (never raises) on any network or HTTP error
+    - Detects FMP legacy-block / plan-error responses (HTTP 200 with body
+      {"Error Message": "..."}) and surfaces them as st.error on the UI
+    - _ui_errors=True forces an st.warning for empty responses too (used by
+      the primary /profile call so the user sees an error immediately)
     """
     if not FMP_API_KEY:
+        st.error(
+            "FMP_API_KEY is empty — no market data can be fetched. "
+            "Check your Streamlit Cloud Secrets panel and confirm the key "
+            "is saved as FMP_API_KEY = your_key. "
+            "Current value seen by app: " + repr(FMP_API_KEY)
+        )
         return None
+
+    full_url = f"{FMP_BASE_URL}{path}"
     try:
         p = {"apikey": FMP_API_KEY}
         if params:
             p.update(params)
-        r = requests.get(f"{FMP_BASE_URL}{path}", params=p, timeout=10)
+        r = requests.get(full_url, params=p, timeout=10)
         r.raise_for_status()
         data = r.json()
-        # FMP legacy / plan errors come back as HTTP 200 with an error dict.
-        # Catch them here so every caller sees None, not a broken dict.
+
+        # FMP returns plan / legacy errors as HTTP 200 with an error dict
         if isinstance(data, dict) and "Error Message" in data:
-            print(f"[FMP blocked] {path}: {data['Error Message'][:120]}")
+            msg = data["Error Message"]
+            print(f"[FMP blocked] {path}: {msg[:140]}")
+            st.error(
+                f"FMP API error for `{path}`: {msg[:250]}. "
+                "This usually means the endpoint is legacy-blocked for your "
+                "account, or the API key has insufficient permissions."
+            )
             return None
+
+        # Empty / unexpected response
+        if data is None or (isinstance(data, (list, dict)) and len(data) == 0):
+            print(f"[FMP empty] {path}")
+            if _ui_errors:
+                st.warning(
+                    f"FMP returned an empty response for `{path}`. "
+                    "The ticker may be invalid or delisted."
+                )
+            return None
+
         return data
+
+    except requests.exceptions.HTTPError as exc:
+        code = exc.response.status_code
+        body = exc.response.text[:200]
+        print(f"[FMP HTTP {code}] {path}: {exc}")
+        st.error(f"FMP HTTP {code} error for `{path}`. Response: {body}")
+        return None
+    except requests.exceptions.ConnectionError:
+        print(f"[FMP connection error] {path}")
+        st.error("Could not reach FMP API — check your internet connection or the FMP service status.")
+        return None
+    except requests.exceptions.Timeout:
+        print(f"[FMP timeout] {path}")
+        st.warning(f"FMP request timed out for `{path}`. Try again in a moment.")
+        return None
     except Exception as exc:
         print(f"[FMP error] {path}: {exc}")
+        st.error(f"Unexpected FMP error for `{path}`: {exc}")
         return None
-
 # ── Stock info ────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=900, show_spinner=False)
 def get_stock_info(ticker: str) -> dict:
@@ -322,9 +394,9 @@ def get_stock_info(ticker: str) -> dict:
         return {}
 
     # ── 1. Profile ────────────────────────────────────────────────────────────
-    profile_data = _fmp_get(f"/profile/{ticker}")
+    profile_data = _fmp_get(f"/profile/{ticker}", _ui_errors=True)
     if not profile_data or not isinstance(profile_data, list):
-        st.error(f"❌ Could not fetch profile for **{ticker}**. Check the ticker symbol.")
+        st.error(f"❌ Could not fetch profile for **{ticker}**. Verify the ticker symbol and that FMP_API_KEY is set correctly.")
         return {}
     p = profile_data[0]
 
