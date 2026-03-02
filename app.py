@@ -11,6 +11,11 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import os, json, requests
+try:
+    import yfinance as yf
+    _YF_AVAILABLE = True
+except ImportError:
+    _YF_AVAILABLE = False
 from langchain_groq import ChatGroq
 
 from whale_terminal_modules import (
@@ -284,7 +289,7 @@ with st.sidebar:
     )
 
 # =============================================================================
-# SHARED DATA HELPERS — FMP only, yfinance fully removed
+# SHARED DATA HELPERS — FMP primary, yfinance automatic fallback
 # =============================================================================
 RANGE_MAP = {
     "1D":{"period":"1d","interval":"5m"},  "5D":{"period":"5d","interval":"15m"},
@@ -292,29 +297,36 @@ RANGE_MAP = {
     "6M":{"period":"6mo","interval":"1d"}, "1Y":{"period":"1y","interval":"1d"},
     "2Y":{"period":"2y","interval":"1wk"}, "5Y":{"period":"5y","interval":"1wk"},
 }
+# Sentinel returned by _fmp_get when FMP actively blocks the request (403 or
+# "Error Message"). Callers test `result is _FMP_BLOCKED` to trigger the yf
+# fallback. None means a genuine empty/missing response.
+class _Blocked:
+    """Singleton sentinel: FMP returned a plan/legacy block, not real data."""
+    _inst = None
+    def __new__(cls):
+        if cls._inst is None: cls._inst = super().__new__(cls)
+        return cls._inst
+    def __repr__(self): return "<FMP_BLOCKED>"
+_FMP_BLOCKED = _Blocked()
+
 FMP_BASE_URL = "https://financialmodelingprep.com/api/v3"
 
 def _fmp_get(path: str, params: dict | None = None,
-             _ui_errors: bool = False) -> list | dict | None:
+             _ui_errors: bool = False):
     """
-    Central FMP v3 request helper.
+    Central FMP v3 request helper. Returns one of three things:
+      - Parsed data (list or dict)   on success
+      - _FMP_BLOCKED sentinel        when FMP returns 403 or an Error Message
+                                     (plan restriction / legacy endpoint block)
+      - None                         on empty response, timeout, or network error
 
-    - Always targets FMP_BASE_URL (https://financialmodelingprep.com/api/v3)
-    - Passes `apikey` as a URL query parameter — the only method FMP accepts
-    - Returns None (never raises) on any network or HTTP error
-    - Detects FMP legacy-block / plan-error responses (HTTP 200 with body
-      {"Error Message": "..."}) and surfaces them as st.error on the UI
-    - _ui_errors=True forces an st.warning for empty responses too (used by
-      the primary /profile call so the user sees an error immediately)
+    Callers check `result is _FMP_BLOCKED` to trigger the yfinance fallback.
+    Only genuine data problems (wrong ticker, delisted) return None.
+    No st.error banners are shown for _FMP_BLOCKED — the fallback is silent.
     """
     if not FMP_API_KEY:
-        st.error(
-            "FMP_API_KEY is empty — no market data can be fetched. "
-            "Check your Streamlit Cloud Secrets panel and confirm the key "
-            "is saved as FMP_API_KEY = your_key. "
-            "Current value seen by app: " + repr(FMP_API_KEY)
-        )
-        return None
+        print("[FMP] FMP_API_KEY is not set")
+        return _FMP_BLOCKED          # no key → treat as blocked, use yf
 
     full_url = f"{FMP_BASE_URL}{path}"
     try:
@@ -322,27 +334,28 @@ def _fmp_get(path: str, params: dict | None = None,
         if params:
             p.update(params)
         r = requests.get(full_url, params=p, timeout=10)
+
+        # 403 = plan restriction → trigger yf fallback silently
+        if r.status_code == 403:
+            print(f"[FMP 403] {path} — switching to Yahoo Finance fallback")
+            return _FMP_BLOCKED
+
         r.raise_for_status()
         data = r.json()
 
-        # FMP returns plan / legacy errors as HTTP 200 with an error dict
+        # FMP returns plan/legacy blocks as HTTP 200 with an error dict
         if isinstance(data, dict) and "Error Message" in data:
             msg = data["Error Message"]
             print(f"[FMP blocked] {path}: {msg[:140]}")
-            st.error(
-                f"FMP API error for `{path}`: {msg[:250]}. "
-                "This usually means the endpoint is legacy-blocked for your "
-                "account, or the API key has insufficient permissions."
-            )
-            return None
+            return _FMP_BLOCKED
 
-        # Empty / unexpected response
+        # Genuinely empty response — wrong ticker, delisted, etc.
         if data is None or (isinstance(data, (list, dict)) and len(data) == 0):
             print(f"[FMP empty] {path}")
             if _ui_errors:
                 st.warning(
-                    f"FMP returned an empty response for `{path}`. "
-                    "The ticker may be invalid or delisted."
+                    f"No data found for this ticker. "
+                    "Please verify the symbol is correct and listed on a major exchange."
                 )
             return None
 
@@ -350,92 +363,146 @@ def _fmp_get(path: str, params: dict | None = None,
 
     except requests.exceptions.HTTPError as exc:
         code = exc.response.status_code
-        body = exc.response.text[:200]
-        print(f"[FMP HTTP {code}] {path}: {exc}")
         if code == 403:
-            st.error(
-                f"⛔ FMP API Plan Restriction (HTTP 403) for `{path}`. "
-                "Your account does not have access to this endpoint. "
-                "This typically means the endpoint requires a paid plan, "
-                "or your account was created after Aug 31 2025 and the endpoint "
-                "is legacy-blocked. Check your FMP subscription at "
-                "https://financialmodelingprep.com/developer/docs/pricing"
-            )
-        else:
-            st.error(f"FMP HTTP {code} error for `{path}`. Response: {body}")
+            print(f"[FMP 403] {path} — switching to Yahoo Finance fallback")
+            return _FMP_BLOCKED
+        print(f"[FMP HTTP {code}] {path}: {exc}")
         return None
-    except requests.exceptions.ConnectionError:
-        print(f"[FMP connection error] {path}")
-        st.error("Could not reach FMP API — check your internet connection or the FMP service status.")
-        return None
-    except requests.exceptions.Timeout:
-        print(f"[FMP timeout] {path}")
-        st.warning(f"FMP request timed out for `{path}`. Try again in a moment.")
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+        print(f"[FMP network error] {path}: {exc}")
         return None
     except Exception as exc:
         print(f"[FMP error] {path}: {exc}")
-        st.error(f"Unexpected FMP error for `{path}`: {exc}")
         return None
+
+# ─── yfinance normaliser ──────────────────────────────────────────────────────
+def _yf_info_to_dict(info: dict) -> dict:
+    """
+    Convert a raw yfinance .info dict to the same key schema used by
+    get_stock_info so the rest of the UI never knows the source changed.
+    """
+    def _f(v):
+        try: return float(v) if v is not None else None
+        except: return None
+    return {
+        "symbol":   info.get("symbol"),
+        "longName": info.get("longName") or info.get("shortName"),
+        "sector":   info.get("sector"),
+        "industry": info.get("industry"),
+        "longBusinessSummary": info.get("longBusinessSummary", ""),
+        "website":  info.get("website", ""),
+        "country":  info.get("country", ""),
+        "fullTimeEmployees": _f(info.get("fullTimeEmployees")),
+        "currentPrice":  _f(info.get("currentPrice") or info.get("regularMarketPrice")),
+        "previousClose": _f(info.get("previousClose") or info.get("regularMarketPreviousClose")),
+        "open":          _f(info.get("open") or info.get("regularMarketOpen")),
+        "dayHigh":       _f(info.get("dayHigh") or info.get("regularMarketDayHigh")),
+        "dayLow":        _f(info.get("dayLow")  or info.get("regularMarketDayLow")),
+        "volume":        _f(info.get("volume")  or info.get("regularMarketVolume")),
+        "marketCap":     _f(info.get("marketCap")),
+        "beta":          _f(info.get("beta")),
+        "fiftyTwoWeekHigh": _f(info.get("fiftyTwoWeekHigh")),
+        "fiftyTwoWeekLow":  _f(info.get("fiftyTwoWeekLow")),
+        "trailingPE":    _f(info.get("trailingPE")),
+        "forwardPE":     _f(info.get("forwardPE")),
+        "pegRatio":      _f(info.get("pegRatio")),
+        "priceToSalesTrailing12Months": _f(info.get("priceToSalesTrailing12Months")),
+        "priceToBook":   _f(info.get("priceToBook")),
+        "enterpriseToEbitda":  _f(info.get("enterpriseToEbitda")),
+        "enterpriseToRevenue": _f(info.get("enterpriseToRevenue")),
+        "trailingEps":     _f(info.get("trailingEps")),
+        "forwardEps":      _f(info.get("forwardEps")),
+        "targetMeanPrice": _f(info.get("targetMeanPrice")),
+        "profitMargins":    _f(info.get("profitMargins")),
+        "operatingMargins": _f(info.get("operatingMargins")),
+        "grossMargins":     _f(info.get("grossMargins")),
+        "returnOnEquity":   _f(info.get("returnOnEquity")),
+        "returnOnAssets":   _f(info.get("returnOnAssets")),
+        "totalDebt":    _f(info.get("totalDebt")),
+        "totalCash":    _f(info.get("totalCash")),
+        "debtToEquity": _f(info.get("debtToEquity")),
+        "quickRatio":   _f(info.get("quickRatio")),
+        "currentRatio": _f(info.get("currentRatio")),
+        "bookValue":    _f(info.get("bookValue")),
+        "freeCashflow":      _f(info.get("freeCashflow")),
+        "operatingCashflow": _f(info.get("operatingCashflow")),
+        "totalRevenue":    _f(info.get("totalRevenue")),
+        "ebitda":          _f(info.get("ebitda")),
+        "netIncomeToCommon": _f(info.get("netIncomeToCommon")),
+        "revenuePerShare": _f(info.get("revenuePerShare")),
+        "revenueGrowth":   _f(info.get("revenueGrowth")),
+        "earningsGrowth":  _f(info.get("earningsGrowth")),
+        "quarterlyRevenueGrowth": _f(info.get("revenueGrowth")),
+        "sharesOutstanding": _f(info.get("sharesOutstanding")),
+        "_source": "Yahoo Finance",
+    }
+
 # ── Stock info ────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=900, show_spinner=False)
 def get_stock_info(ticker: str) -> dict:
     """
-    Fetch full company fundamentals from FMP v3 — no legacy endpoints.
+    Fetch full company fundamentals. FMP is primary; yfinance is the automatic
+    silent fallback if FMP returns a 403 or plan/legacy error.
 
-    Endpoints used (all confirmed available to accounts created after Aug 2025):
-      /api/v3/profile/{ticker}                — overview, price, market cap, beta
-      /api/v3/quote/{ticker}                  — live price, previousClose, day
-                                                high/low, volume, 52-wk range
-      /api/v3/ratios/{ticker}                 — P/E, P/B, P/S, EV/EBITDA, margins,
-                                                ROE, ROA, D/E, quick/current ratio,
-                                                FCF per share  (period=annual)
-      /api/v3/key-metrics/{ticker}            — book value/share, revenue/share,
-                                                EV/Revenue, PEG ratio (period=annual)
-      /api/v3/income-statement/{ticker}       — revenue, net income, EPS, EBITDA;
-                                                two rows used for YoY growth calc
-      /api/v3/balance-sheet-statement/{ticker}— total debt, cash, shares outstanding
+    FMP endpoints (non-legacy, available to all account tiers):
+      /profile, /quote, /ratios, /key-metrics, /income-statement,
+      /balance-sheet-statement
 
-    Removed (legacy-blocked for new accounts):
-      /key-metrics-ttm  → replaced by /ratios + /key-metrics  (period=annual)
-      /financial-growth → YoY growth now computed from two income-statement rows
+    Yahoo Finance fallback:
+      yf.Ticker(ticker).info — provides the same key schema via _yf_info_to_dict
     """
-    if not FMP_API_KEY:
-        st.warning("⚠️ **FMP_API_KEY** not configured — stock data unavailable.")
-        return {}
+    def _f(v):
+        try: return float(v) if v is not None else None
+        except: return None
+    _r = _f  # /ratios returns 0-1 decimals already
 
-    # ── 1. Profile ────────────────────────────────────────────────────────────
+    # ── 1. FMP profile — the gating call ─────────────────────────────────────
     profile_data = _fmp_get(f"/profile/{ticker}", _ui_errors=True)
+    if profile_data is _FMP_BLOCKED:
+        # FMP blocked → fall silently to Yahoo Finance
+        print(f"[Fallback] get_stock_info({ticker}) → Yahoo Finance")
+        st.info(f"ℹ️ Using backup data source for {ticker}", icon="ℹ️")
+        try:
+            info = yf.Ticker(ticker).info
+            if not info or not info.get("symbol"):
+                st.error(f"❌ Could not fetch data for **{ticker}** from either FMP or Yahoo Finance.")
+                return {}
+            return _yf_info_to_dict(info)
+        except Exception as exc:
+            st.error(f"❌ Yahoo Finance fallback also failed for **{ticker}**: {exc}")
+            return {}
+
     if not profile_data or not isinstance(profile_data, list):
-        st.error(f"❌ Could not fetch profile for **{ticker}**. Verify the ticker symbol and that FMP_API_KEY is set correctly.")
+        st.error(
+            f"❌ Could not fetch profile for **{ticker}**. "
+            "Verify the ticker symbol is correct and listed on a major exchange."
+        )
         return {}
     p = profile_data[0]
 
-    # ── 2. Real-time quote (freshest price + prev-close + day range) ──────────
+    # ── 2. Real-time quote ────────────────────────────────────────────────────
     qt: dict = {}
     qt_data = _fmp_get(f"/quote/{ticker}")
-    if qt_data and isinstance(qt_data, list) and qt_data:
+    if qt_data and qt_data is not _FMP_BLOCKED and isinstance(qt_data, list):
         qt = qt_data[0]
 
-    # ── 3. Financial ratios — /ratios (non-legacy, period=annual) ─────────────
-    #    Provides: P/E, P/B, P/S, EV/EBITDA, gross/op/net margins, ROE, ROA,
-    #    D/E, current ratio, quick ratio, FCF per share — all as 0-1 decimals
+    # ── 3. Financial ratios (non-legacy) ──────────────────────────────────────
     ra: dict = {}
     ra_data = _fmp_get(f"/ratios/{ticker}", {"period": "annual", "limit": 1})
-    if ra_data and isinstance(ra_data, list) and ra_data:
+    if ra_data and ra_data is not _FMP_BLOCKED and isinstance(ra_data, list):
         ra = ra_data[0]
 
-    # ── 4. Key metrics — /key-metrics (non-legacy, period=annual) ─────────────
-    #    Provides: book value/share, revenue/share, EV/Revenue, PEG ratio
+    # ── 4. Key metrics (non-legacy) ───────────────────────────────────────────
     km: dict = {}
     km_data = _fmp_get(f"/key-metrics/{ticker}", {"period": "annual", "limit": 1})
-    if km_data and isinstance(km_data, list) and km_data:
+    if km_data and km_data is not _FMP_BLOCKED and isinstance(km_data, list):
         km = km_data[0]
 
-    # ── 5. Income statement — two periods to compute YoY growth ──────────────
+    # ── 5. Income statement (two rows for YoY growth) ─────────────────────────
     inc: dict = {}
     _rev_growth = _ni_growth = None
     inc_data = _fmp_get(f"/income-statement/{ticker}", {"period": "annual", "limit": 2})
-    if inc_data and isinstance(inc_data, list) and inc_data:
+    if inc_data and inc_data is not _FMP_BLOCKED and isinstance(inc_data, list):
         inc = inc_data[0]
         if len(inc_data) >= 2:
             rev0 = float(inc_data[0].get("revenue") or 0)
@@ -445,25 +512,16 @@ def get_stock_info(ticker: str) -> dict:
             _rev_growth = (rev0 - rev1) / abs(rev1) if rev1 else None
             _ni_growth  = (ni0  - ni1)  / abs(ni1)  if ni1  else None
 
-    # ── 6. Balance sheet — debt, cash, shares ─────────────────────────────────
+    # ── 6. Balance sheet ──────────────────────────────────────────────────────
     bs: dict = {}
     bs_data = _fmp_get(f"/balance-sheet-statement/{ticker}", {"period": "annual", "limit": 1})
-    if bs_data and isinstance(bs_data, list) and bs_data:
+    if bs_data and bs_data is not _FMP_BLOCKED and isinstance(bs_data, list):
         bs = bs_data[0]
 
-    # ── Helpers ────────────────────────────────────────────────────────────────
-    def _f(v):
-        try: return float(v) if v is not None else None
-        except: return None
-
-    # /ratios already returns margins/ROE/ROA as 0-1 decimals — no conversion needed
-    _r = _f
-
-    # Live price: quote is fresher than profile snapshot
-    live_price = _f(qt.get("price"))   or _f(p.get("price"))
+    # Live price: quote fresher than profile
+    live_price = _f(qt.get("price")) or _f(p.get("price"))
     prev_close = _f(qt.get("previousClose")) or live_price
 
-    # 52-wk range: prefer quote fields, fall back to profile "low-high" string
     wk52_high = _f(qt.get("yearHigh"))
     wk52_low  = _f(qt.get("yearLow"))
     if not wk52_high:
@@ -477,7 +535,6 @@ def get_stock_info(ticker: str) -> dict:
                 pass
 
     return {
-        # ── Identity
         "symbol":   p.get("symbol"),
         "longName": p.get("companyName"),
         "sector":   p.get("sector"),
@@ -486,7 +543,6 @@ def get_stock_info(ticker: str) -> dict:
         "website":  p.get("website", ""),
         "country":  p.get("country", ""),
         "fullTimeEmployees": _f(p.get("fullTimeEmployees")),
-        # ── Price  (quote preferred — fresher than profile snapshot)
         "currentPrice":     live_price,
         "previousClose":    prev_close,
         "open":             _f(qt.get("open"))    or live_price,
@@ -497,38 +553,32 @@ def get_stock_info(ticker: str) -> dict:
         "beta":             _f(p.get("beta")),
         "fiftyTwoWeekHigh": wk52_high,
         "fiftyTwoWeekLow":  wk52_low,
-        # ── Valuation  (/ratios and /key-metrics — both non-legacy)
         "trailingPE":  _r(ra.get("priceEarningsRatioTTM") or ra.get("priceEarningsRatio")),
         "forwardPE":   _r(ra.get("priceEarningsRatioTTM") or ra.get("priceEarningsRatio")),
         "pegRatio":    _r(km.get("pegRatio")),
         "priceToSalesTrailing12Months": _r(ra.get("priceToSalesRatioTTM") or ra.get("priceToSalesRatio")),
-        "priceToBook": _r(ra.get("priceToBookRatioTTM")   or ra.get("priceToBookRatio")),
+        "priceToBook": _r(ra.get("priceToBookRatioTTM") or ra.get("priceToBookRatio")),
         "enterpriseToEbitda":  _r(km.get("enterpriseValueOverEBITDA")),
         "enterpriseToRevenue": _r(km.get("evToSales")),
-        # ── Earnings
         "trailingEps":     _f(inc.get("epsdiluted") or p.get("eps")),
         "forwardEps":      _f(inc.get("epsdiluted") or p.get("eps")),
         "targetMeanPrice": _f(p.get("dcf")),
-        # ── Profitability  (/ratios returns these as 0-1 decimals already)
         "profitMargins":    _r(ra.get("netProfitMarginTTM")       or ra.get("netProfitMargin")),
         "operatingMargins": _r(ra.get("operatingProfitMarginTTM") or ra.get("operatingProfitMargin")),
         "grossMargins":     _r(ra.get("grossProfitMarginTTM")     or ra.get("grossProfitMargin")),
         "returnOnEquity":   _r(ra.get("returnOnEquityTTM")        or ra.get("returnOnEquity")),
         "returnOnAssets":   _r(ra.get("returnOnAssetsTTM")        or ra.get("returnOnAssets")),
-        # ── Balance sheet
         "totalDebt":    _f(bs.get("totalDebt")              or p.get("totalDebt")),
         "totalCash":    _f(bs.get("cashAndCashEquivalents") or p.get("cash")),
         "debtToEquity": _r(ra.get("debtEquityRatioTTM")     or ra.get("debtEquityRatio")),
         "quickRatio":   _r(ra.get("quickRatioTTM")          or ra.get("quickRatio")),
         "currentRatio": _r(ra.get("currentRatioTTM")        or ra.get("currentRatio")),
         "bookValue":    _f(km.get("bookValuePerShare")),
-        # ── Cash flow
         "freeCashflow": (
             (_f(ra.get("freeCashFlowPerShareTTM") or ra.get("freeCashFlowPerShare")) or 0) *
             (_f(bs.get("commonStock") or p.get("sharesOutstanding")) or 1)
         ) if (ra.get("freeCashFlowPerShareTTM") or ra.get("freeCashFlowPerShare")) else None,
         "operatingCashflow": _f(inc.get("operatingCashFlow")),
-        # ── Revenue / growth  (YoY computed from two income-statement rows)
         "totalRevenue":    _f(inc.get("revenue")    or p.get("revenue")),
         "ebitda":          _f(inc.get("ebitda")),
         "netIncomeToCommon": _f(inc.get("netIncome")),
@@ -536,26 +586,62 @@ def get_stock_info(ticker: str) -> dict:
         "revenueGrowth":   _rev_growth,
         "earningsGrowth":  _ni_growth,
         "quarterlyRevenueGrowth": _rev_growth,
-        # ── Shares
         "sharesOutstanding": _f(bs.get("commonStock") or p.get("sharesOutstanding")),
         "_source": "FMP-v3",
     }
 # ── OHLCV history ─────────────────────────────────────────────────────────────
+def _yf_history(ticker: str, period: str, interval: str) -> "pd.DataFrame":
+    """Fetch OHLCV from Yahoo Finance and normalise to the same shape as FMP."""
+    empty = pd.DataFrame()
+    try:
+        # Map app period/interval codes → yfinance equivalents
+        yf_period_map = {
+            "1d":"1d","5d":"5d","1mo":"1mo","3mo":"3mo",
+            "6mo":"6mo","1y":"1y","2y":"2y","5y":"5y",
+        }
+        yf_interval_map = {
+            "5m":"5m","15m":"15m","30m":"30m","1h":"1h",
+            "1d":"1d","1wk":"1wk",
+        }
+        yp = yf_period_map.get(period, "1y")
+        yi = yf_interval_map.get(interval, "1d")
+        df = yf.Ticker(ticker).history(period=yp, interval=yi)
+        if df.empty:
+            return empty
+        # yfinance columns: Open High Low Close Volume
+        df = df[["Open","High","Low","Close","Volume"]].copy()
+        df.index = pd.to_datetime(df.index)
+        # Strip timezone so Arrow serialisation never trips
+        if hasattr(df.index, "tz") and df.index.tz is not None:
+            df.index = df.index.tz_convert("UTC").tz_localize(None)
+        df.index.name = "Date"
+        return df.dropna()
+    except Exception as exc:
+        print(f"[yf history error] {ticker}: {exc}")
+        return empty
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_stock_history(ticker: str, period: str, interval: str) -> "pd.DataFrame":
     """
-    Fetch OHLCV from FMP — no yfinance.
-    Intraday (5m/15m) → /historical-chart/{interval}/{ticker}
-    Daily/weekly      → /historical-price-full/{ticker}
-    Returns a tz-naive DataFrame with columns Open, High, Low, Close, Volume.
+    Fetch OHLCV. FMP is primary; yfinance is the automatic silent fallback
+    when FMP returns a 403 or plan/legacy error.
+
+    FMP paths:
+      Intraday  → /historical-chart/{interval}/{ticker}
+      Daily/wk  → /historical-price-full/{ticker}
+
+    Yahoo Finance fallback:
+      yf.Ticker(ticker).history(period, interval)
     """
     empty = pd.DataFrame()
-    if not FMP_API_KEY:
-        return empty
 
     # ── Intraday ──────────────────────────────────────────────────────────────
     if interval in ("5m","15m","30m","1h"):
         data = _fmp_get(f"/historical-chart/{interval}/{ticker}")
+        if data is _FMP_BLOCKED:
+            print(f"[Fallback] history intraday {ticker} → Yahoo Finance")
+            st.info(f"ℹ️ Using backup data source for {ticker}", icon="ℹ️")
+            return _yf_history(ticker, period, interval)
         if not data or not isinstance(data, list):
             return empty
         df = (pd.DataFrame(data)
@@ -563,7 +649,6 @@ def get_stock_history(ticker: str, period: str, interval: str) -> "pd.DataFrame"
                                 "low":"Low","close":"Close","volume":"Volume"}))
         df["Date"] = pd.to_datetime(df["Date"])
         df = df.set_index("Date").sort_index()
-        # Trim to the look-back window
         cutoff = {"1d": 1, "5d": 5}.get(period, 1)
         df = df[df.index >= df.index[-1] - pd.Timedelta(days=cutoff)]
         return df[["Open","High","Low","Close","Volume"]].dropna()
@@ -574,6 +659,11 @@ def get_stock_history(ticker: str, period: str, interval: str) -> "pd.DataFrame"
     from_date = (datetime.now() - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
 
     data = _fmp_get(f"/historical-price-full/{ticker}", {"from": from_date})
+    if data is _FMP_BLOCKED:
+        print(f"[Fallback] history daily {ticker} → Yahoo Finance")
+        st.info(f"ℹ️ Using backup data source for {ticker}", icon="ℹ️")
+        return _yf_history(ticker, period, interval)
+
     if not data or not isinstance(data, dict):
         return empty
     hist_list = data.get("historical", [])
@@ -592,34 +682,45 @@ def get_stock_history(ticker: str, period: str, interval: str) -> "pd.DataFrame"
         ).dropna()
 
     return df[["Open","High","Low","Close","Volume"]].dropna()
-
-
 @st.cache_data(ttl=300, show_spinner=False)
 def _fmp_quote_batch(tickers: tuple) -> dict[str, dict]:
     """
-    Fetch real-time quotes for one or more tickers via FMP /api/v3/quote/{ticker}.
-
-    NOTE: The comma-separated batch endpoint (/quote/AAPL,MSFT,NVDA) is a legacy
-    endpoint blocked for FMP accounts created after Aug 31 2025 (HTTP 403 or
-    "Legacy Endpoint" error message).  This implementation calls /quote/{ticker}
-    individually for each symbol in a simple loop and merges results into a single
-    dict keyed by ticker symbol.  The cache TTL (5 min) amortises the extra calls.
-
-    Args:
-        tickers: Hashable tuple of uppercase ticker strings, e.g. ("AAPL","MSFT")
-
-    Returns:
-        {SYMBOL: quote_dict, ...} — empty dict if API key is absent or all calls fail
+    Fetch real-time quotes for one or more tickers.
+    FMP /quote/{symbols} is primary (single batch call).
+    If FMP is blocked (403 / plan error), yfinance is used per-ticker silently.
+    Returns {TICKER: quote_dict} where quote_dict contains at minimum
+    "price" and "changesPercentage" keys.
     """
-    if not FMP_API_KEY or not tickers:
+    if not tickers:
         return {}
+
+    # ── Try FMP batch first ───────────────────────────────────────────────────
+    if FMP_API_KEY:
+        symbols = ",".join(tickers)
+        data = _fmp_get(f"/quote/{symbols}")
+        if data is not _FMP_BLOCKED and data and isinstance(data, list):
+            return {item["symbol"]: item for item in data if "symbol" in item}
+        if data is _FMP_BLOCKED:
+            print(f"[Fallback] _fmp_quote_batch → Yahoo Finance for {tickers}")
+
+    # ── Yahoo Finance fallback (per-ticker) ───────────────────────────────────
     result: dict[str, dict] = {}
     for sym in tickers:
-        data = _fmp_get(f"/quote/{sym}")
-        if data and isinstance(data, list) and data:
-            item = data[0]
-            if "symbol" in item:
-                result[item["symbol"]] = item
+        try:
+            t = yf.Ticker(sym)
+            info = t.fast_info          # fast_info avoids full .info round-trip
+            price  = float(getattr(info, "last_price", None) or 0)
+            prev   = float(getattr(info, "previous_close", None) or price or 1)
+            chg_pct = ((price - prev) / prev * 100) if prev else 0.0
+            result[sym] = {
+                "symbol":            sym,
+                "price":             price,
+                "changesPercentage": chg_pct,
+                "marketCap":         float(getattr(info, "market_cap", None) or 0),
+                "_source":           "Yahoo Finance",
+            }
+        except Exception as exc:
+            print(f"[yf quote error] {sym}: {exc}")
     return result
 
 
@@ -2114,13 +2215,10 @@ def page_news():
     )
     c1, c2 = st.columns([4,1])
     with c1:
-        query_input = st.text_input(
-            "Search topic",
+        query_input = st.text_input("Search topic",
             value="stock market finance economy Fed interest rates",
             placeholder="e.g. Fed rate cut, tech earnings, oil market",
-            label_visibility="collapsed",
-            help="Keywords to search. Try specific topics like 'NVDA AI chips'",
-        )
+            help="Keywords to search. Try specific topics like 'NVDA AI chips'")
     with c2:
         fetch_btn = st.button("🔄 Fetch", type="primary",
                               use_container_width=True, key="news_fetch")

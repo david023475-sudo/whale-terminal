@@ -6,6 +6,11 @@
 # =============================================================================
 from __future__ import annotations
 import os, json, math, requests
+try:
+    import yfinance as yf
+    _YF_AVAILABLE = True
+except ImportError:
+    _YF_AVAILABLE = False
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -26,70 +31,54 @@ SECTOR_COLORS = {
     "Consumer Defensive":"#56d364","Utilities":"#ffa657","Real Estate":"#ff7b72",
     "Basic Materials":"#d2a8ff","Communication Services":"#63e6be",
 }
+# Sentinel: FMP returned a plan/legacy block (not an empty/missing result).
+# _fmp_get returns this object; callers test `result is _FMP_BLOCKED`.
+class _Blocked:
+    _inst = None
+    def __new__(cls):
+        if cls._inst is None: cls._inst = super().__new__(cls)
+        return cls._inst
+    def __repr__(self): return "<FMP_BLOCKED>"
+_FMP_BLOCKED = _Blocked()
+
 FMP_BASE = "https://financialmodelingprep.com/api/v3"
 
-def _fmp_get(path: str, params: dict | None = None, api_key: str = "") -> list | dict | None:
+def _fmp_get(path: str, params: dict | None = None, api_key: str = ""):
     """
-    Central FMP v3 helper for this module.
+    Central FMP v3 helper for this module. Returns one of:
+      - Parsed data (list or dict)   on success
+      - _FMP_BLOCKED sentinel        on 403 or plan/legacy "Error Message"
+      - None                         on empty result, timeout, network error
 
-    • Base URL: https://financialmodelingprep.com/api/v3  (FMP_BASE constant)
-    • API key priority: explicit arg → st.secrets["FMP_API_KEY"] → env var → None
-    • Detects HTTP 403 "API Plan Restrictions" and surfaces via st.error
-    • Detects {"Error Message": "..."} legacy-block responses (HTTP 200) and
-      surfaces them via st.error so the operator can see the reason in the UI
-    • Returns None on any error so callers never process an error payload as data
+    Callers test `result is _FMP_BLOCKED` to trigger yfinance fallback.
     """
-    # ── Resolve API key ────────────────────────────────────────────────────────
     key = api_key or ""
     if not key:
         try:
-            key = str(st.secrets["FMP_API_KEY"])
-        except (KeyError, FileNotFoundError, Exception):
-            pass
+            key = str(st.secrets.get("FMP_API_KEY", ""))
+        except Exception:
+            key = ""
     if not key:
-        key = os.environ.get("FMP_API_KEY", "")
-    if not key:
-        return None
-
-    # ── Build and fire request ─────────────────────────────────────────────────
+        print("[FMP modules] no API key — using _FMP_BLOCKED signal")
+        return _FMP_BLOCKED
     try:
         p = {"apikey": key}
         if params:
             p.update(params)
         r = requests.get(f"{FMP_BASE}{path}", params=p, timeout=10)
-
-        # ── HTTP-level errors ─────────────────────────────────────────────────
         if r.status_code == 403:
-            print(f"[FMP 403] {path}")
-            st.error(
-                f"⛔ FMP API Plan Restriction (HTTP 403) for `{path}`. "
-                "Your account does not have access to this endpoint. "
-                "This typically means the endpoint requires a paid plan, "
-                "or your account was created after Aug 31 2025 and the endpoint "
-                "is legacy-blocked. Check https://financialmodelingprep.com/developer/docs/pricing"
-            )
-            return None
-
+            print(f"[FMP 403] {path} — will fall back to Yahoo Finance")
+            return _FMP_BLOCKED
         r.raise_for_status()
         data = r.json()
-
-        # ── Application-level legacy / plan errors (HTTP 200 with error body) ─
         if isinstance(data, dict) and "Error Message" in data:
-            msg = data["Error Message"]
-            print(f"[FMP blocked] {path}: {msg[:120]}")
-            st.error(
-                f"FMP API error for `{path}`: {msg[:250]}. "
-                "This usually means the endpoint is legacy-blocked for your account "
-                "or the API key has insufficient permissions."
-            )
-            return None
-
+            print(f"[FMP blocked] {path}: {data['Error Message'][:120]}")
+            return _FMP_BLOCKED
         return data
-
     except requests.exceptions.HTTPError as exc:
-        code = exc.response.status_code if exc.response is not None else "?"
-        print(f"[FMP HTTP {code}] {path}: {exc}")
-        st.error(f"FMP HTTP {code} error for `{path}`. Check your API key and subscription plan.")
+        if exc.response.status_code == 403:
+            return _FMP_BLOCKED
+        print(f"[FMP HTTP error] {path}: {exc}")
         return None
     except Exception as exc:
         print(f"[FMP error] {path}: {exc}")
@@ -99,10 +88,22 @@ def _fmp_get(path: str, params: dict | None = None, api_key: str = "") -> list |
 @st.cache_data(ttl=300, show_spinner=False)
 def _fmp_price(ticker: str, api_key: str = "") -> tuple[float | None, float]:
     """
-    Return (current_price, change_pct) for a single ticker via FMP /quote.
-    Used by watchlist and portfolio live-price lookups.
+    Return (current_price, change_pct) for a single ticker.
+    FMP /quote is primary; yfinance fast_info is the silent fallback on 403.
     """
     data = _fmp_get(f"/quote/{ticker}", api_key=api_key)
+    if data is _FMP_BLOCKED:
+        # Silent yfinance fallback
+        try:
+            info = yf.Ticker(ticker).fast_info
+            price = float(getattr(info, "last_price", None) or 0) or None
+            prev  = float(getattr(info, "previous_close", None) or price or 1)
+            chg   = ((price - prev) / prev * 100) if (price and prev) else 0.0
+            print(f"[Fallback] _fmp_price({ticker}) → Yahoo Finance: {price}")
+            return price, chg
+        except Exception as exc:
+            print(f"[yf price error] {ticker}: {exc}")
+            return None, 0.0
     if data and isinstance(data, list) and data:
         q = data[0]
         price = q.get("price")
@@ -112,16 +113,43 @@ def _fmp_price(ticker: str, api_key: str = "") -> tuple[float | None, float]:
     return None, 0.0
 
 
+def _yf_ohlcv(ticker: str, period: str, interval: str) -> "pd.DataFrame":
+    """Yahoo Finance OHLCV helper used as fallback inside _fmp_history."""
+    empty = pd.DataFrame()
+    try:
+        yf_period_map = {
+            "2d":"2d","1mo":"1mo","3mo":"3mo","6mo":"6mo",
+            "1y":"1y","2y":"2y","5y":"5y",
+        }
+        yf_interval_map = {"5m":"5m","15m":"15m","30m":"30m","1h":"1h","1d":"1d","1wk":"1wk"}
+        yp = yf_period_map.get(period, "1y")
+        yi = yf_interval_map.get(interval, "1d")
+        df = yf.Ticker(ticker).history(period=yp, interval=yi)
+        if df.empty:
+            return empty
+        df = df[["Open","High","Low","Close","Volume"]].copy()
+        df.index = pd.to_datetime(df.index)
+        if hasattr(df.index, "tz") and df.index.tz is not None:
+            df.index = df.index.tz_convert("UTC").tz_localize(None)
+        df.index.name = "Date"
+        return df.dropna()
+    except Exception as exc:
+        print(f"[yf ohlcv error] {ticker}: {exc}")
+        return empty
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def _fmp_history(ticker: str, period: str = "1y", interval: str = "1d",
                  api_key: str = "") -> "pd.DataFrame":
     """
-    Fetch OHLCV history from FMP — mirrors app.py's get_stock_history logic.
-    Used internally by portfolio benchmark and relative-strength calculations.
+    Fetch OHLCV history. FMP primary; yfinance silent fallback on 403.
+    Used by portfolio benchmark and relative-strength calculations.
     """
     empty = pd.DataFrame()
     if interval in ("5m","15m","30m","1h"):
         data = _fmp_get(f"/historical-chart/{interval}/{ticker}", api_key=api_key)
+        if data is _FMP_BLOCKED:
+            print(f"[Fallback] _fmp_history intraday {ticker} → Yahoo Finance")
+            return _yf_ohlcv(ticker, period, interval)
         if not data or not isinstance(data, list):
             return empty
         df = (pd.DataFrame(data)
@@ -134,6 +162,9 @@ def _fmp_history(ticker: str, period: str = "1y", interval: str = "1d",
     days = period_days.get(period, 365)
     from_date = (datetime.now() - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
     data = _fmp_get(f"/historical-price-full/{ticker}", {"from": from_date}, api_key=api_key)
+    if data is _FMP_BLOCKED:
+        print(f"[Fallback] _fmp_history daily {ticker} → Yahoo Finance")
+        return _yf_ohlcv(ticker, period, interval)
     if not data or not isinstance(data, dict):
         return empty
     hist = data.get("historical", [])
@@ -973,13 +1004,10 @@ def render_polymarket_tab(ticker: str, sector: str = "") -> None:
 # =============================================================================
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _fetch_fmp(endpoint: str, params: dict) -> list | dict | None:
+def _fetch_fmp(endpoint: str, params: dict):
     """
-    DCF-facing FMP helper. Accepts full URLs (f"{FMP_BASE}/cash-flow-statement/...")
-    for backward-compatibility, strips the base prefix and delegates to _fmp_get
-    so the "Error Message" legacy-block guard is always active.
-    `apikey` is extracted from params and passed via _fmp_get, which injects it
-    as a URL query parameter — the only method FMP honours.
+    DCF-facing FMP helper. Delegates to _fmp_get (strips FMP_BASE prefix).
+    Propagates _FMP_BLOCKED so calculate_dcf can fall back to yfinance.
     """
     try:
         path = endpoint
@@ -1012,10 +1040,14 @@ def calculate_dcf(
         cash_and_equivalents: float = 0.0
         minority_interest: float = 0.0
 
+        _fmp_blocked_flag = False
+
         if fmp_api_key:
             cf_data = _fetch_fmp(f"{FMP_BASE}/cash-flow-statement/{ticker}",
                                  {"apikey": fmp_api_key, "limit": 4})
-            if cf_data and isinstance(cf_data, list):
+            if cf_data is _FMP_BLOCKED:
+                _fmp_blocked_flag = True
+            elif cf_data and isinstance(cf_data, list):
                 for yr in cf_data:
                     fcf = yr.get("freeCashFlow") or (
                         (yr.get("operatingCashFlow") or 0) -
@@ -1024,26 +1056,60 @@ def calculate_dcf(
                     if fcf:
                         fcf_history.append(float(fcf))
 
-            bs_data = _fetch_fmp(f"{FMP_BASE}/balance-sheet-statement/{ticker}",
-                                 {"apikey": fmp_api_key, "limit": 1})
-            if bs_data and isinstance(bs_data, list) and bs_data:
-                bs = bs_data[0]
-                total_debt           = float(bs.get("totalDebt", 0) or 0)
-                cash_and_equivalents = float(bs.get("cashAndCashEquivalents", 0) or 0)
-                minority_interest    = float(bs.get("minorityInterest", 0) or 0)
+            if not _fmp_blocked_flag:
+                bs_data = _fetch_fmp(f"{FMP_BASE}/balance-sheet-statement/{ticker}",
+                                     {"apikey": fmp_api_key, "limit": 1})
+                if bs_data is _FMP_BLOCKED:
+                    _fmp_blocked_flag = True
+                elif bs_data and isinstance(bs_data, list) and bs_data:
+                    bs = bs_data[0]
+                    total_debt           = float(bs.get("totalDebt", 0) or 0)
+                    cash_and_equivalents = float(bs.get("cashAndCashEquivalents", 0) or 0)
+                    minority_interest    = float(bs.get("minorityInterest", 0) or 0)
 
-            profile = _fetch_fmp(f"{FMP_BASE}/profile/{ticker}", {"apikey": fmp_api_key})
-            if profile and isinstance(profile, list) and profile:
-                current_price      = float(profile[0].get("price", 0) or 0)
-                shares_outstanding = float(profile[0].get("sharesOutstanding", 0) or 0)
+            if not _fmp_blocked_flag:
+                profile = _fetch_fmp(f"{FMP_BASE}/profile/{ticker}", {"apikey": fmp_api_key})
+                if profile is _FMP_BLOCKED:
+                    _fmp_blocked_flag = True
+                elif profile and isinstance(profile, list) and profile:
+                    current_price      = float(profile[0].get("price", 0) or 0)
+                    shares_outstanding = float(profile[0].get("sharesOutstanding", 0) or 0)
+
+        # ── yfinance fallback for DCF inputs when FMP is blocked ──────────────
+        if _fmp_blocked_flag or (not fcf_history and not current_price):
+            print(f"[Fallback] calculate_dcf({ticker}) → Yahoo Finance")
+            try:
+                t   = yf.Ticker(ticker)
+                cf  = t.cashflow
+                if cf is not None and not cf.empty:
+                    for col in cf.columns:
+                        try:
+                            op  = float(cf.loc["Operating Cash Flow", col] if "Operating Cash Flow" in cf.index else 0)
+                            cap = abs(float(cf.loc["Capital Expenditure", col] if "Capital Expenditure" in cf.index else 0))
+                            fcf_val = op - cap
+                            if fcf_val:
+                                fcf_history.append(fcf_val)
+                        except Exception:
+                            pass
+                inf = t.info
+                if not current_price:
+                    current_price = float(inf.get("currentPrice") or inf.get("regularMarketPrice") or 0)
+                if not shares_outstanding:
+                    shares_outstanding = float(inf.get("sharesOutstanding") or 0)
+                if not total_debt:
+                    total_debt = float(inf.get("totalDebt") or 0)
+                if not cash_and_equivalents:
+                    cash_and_equivalents = float(inf.get("totalCash") or 0)
+            except Exception as exc:
+                print(f"[yf DCF fallback error] {ticker}: {exc}")
 
         if not fcf_history or not current_price or not shares_outstanding:
-            # FMP supplemental — try income statement for any missing fields
-            if fmp_api_key:
+            # FMP supplemental — try income statement for any remaining missing fields
+            if fmp_api_key and not _fmp_blocked_flag:
                 try:
                     inc = _fetch_fmp(f"{FMP_BASE}/income-statement/{ticker}",
                                      {"apikey": fmp_api_key, "limit": 1})
-                    if inc and isinstance(inc, list) and inc:
+                    if inc and inc is not _FMP_BLOCKED and isinstance(inc, list) and inc:
                         i0 = inc[0]
                         if not fcf_history:
                             op  = float(i0.get("operatingCashFlow") or 0)
@@ -1052,7 +1118,7 @@ def calculate_dcf(
                                 fcf_history = [op - abs(cap)]
                         if not current_price:
                             q = _fmp_get(f"/quote/{ticker}", api_key=fmp_api_key)
-                            if q and isinstance(q, list) and q:
+                            if q and q is not _FMP_BLOCKED and isinstance(q, list) and q:
                                 current_price = float(q[0].get("price") or 0)
                         if not shares_outstanding:
                             shares_outstanding = float(i0.get("weightedAverageShsOutDil") or 0)
