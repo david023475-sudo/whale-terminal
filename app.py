@@ -375,34 +375,45 @@ def _fmp_get(path: str, params: dict | None = None,
         print(f"[FMP error] {path}: {exc}")
         return None
 
-# ─── yfinance normaliser ──────────────────────────────────────────────────────
+# ─── yfinance helpers ─────────────────────────────────────────────────────────
 def _price_date_str(yf_info: dict) -> str:
     """
     Convert the regularMarketTime unix timestamp from yf.Ticker.info into a
-    human-readable string like '2025-03-04 16:00 ET'.
-    Falls back to today's date if the field is missing or unparseable.
-    This is the exchange-confirmed timestamp of the last traded price — it tells
-    you whether ratios are based on today's live price or yesterday's close.
+    readable string like '2025-03-04 16:00 ET'.  Falls back to today's date.
+    This is the exchange-confirmed timestamp of the last traded price — tells
+    you whether ratios are based on live price or yesterday's close.
     """
     try:
         ts = yf_info.get("regularMarketTime") or yf_info.get("lastTradeTime")
         if ts and isinstance(ts, (int, float)):
             from datetime import timezone, timedelta
-            et = timezone(timedelta(hours=-5))          # Eastern Standard Time offset
-            dt = datetime.fromtimestamp(float(ts), tz=et)
+            dt = datetime.fromtimestamp(float(ts), tz=timezone(timedelta(hours=-5)))
             return dt.strftime("%Y-%m-%d %H:%M ET")
     except Exception:
         pass
     return datetime.now().strftime("%Y-%m-%d")
 
+
 def _yf_info_to_dict(info: dict) -> dict:
     """
     Convert a raw yfinance .info dict to the same key schema used by
     get_stock_info so the rest of the UI never knows the source changed.
+    Used when FMP is fully blocked (403 / plan error).
+    All forward-looking fields come exclusively from yfinance — no FMP fallback.
     """
     def _f(v):
         try: return float(v) if v is not None else None
         except: return None
+
+    price  = _f(info.get("currentPrice") or info.get("regularMarketPrice"))
+    shares = _f(info.get("sharesOutstanding"))
+    fwd_eps = _f(info.get("forwardEps"))          # analyst next-FY consensus — the real one
+    fwd_pe  = (round(price / fwd_eps, 2)
+               if price and fwd_eps and fwd_eps > 0 else None)
+    mkt_cap = (price * shares
+               if price and shares
+               else _f(info.get("marketCap")))     # price×shares is always current
+
     return {
         "symbol":   info.get("symbol"),
         "longName": info.get("longName") or info.get("shortName"),
@@ -412,32 +423,30 @@ def _yf_info_to_dict(info: dict) -> dict:
         "website":  info.get("website", ""),
         "country":  info.get("country", ""),
         "fullTimeEmployees": _f(info.get("fullTimeEmployees")),
-        "currentPrice":  _f(info.get("currentPrice") or info.get("regularMarketPrice")),
+        "currentPrice":  price,
         "previousClose": _f(info.get("previousClose") or info.get("regularMarketPreviousClose")),
         "open":          _f(info.get("open") or info.get("regularMarketOpen")),
         "dayHigh":       _f(info.get("dayHigh") or info.get("regularMarketDayHigh")),
         "dayLow":        _f(info.get("dayLow")  or info.get("regularMarketDayLow")),
         "volume":        _f(info.get("volume")  or info.get("regularMarketVolume")),
-        "marketCap":     _f(info.get("marketCap")),
+        "marketCap":     mkt_cap,
         "beta":          _f(info.get("beta")),
         "fiftyTwoWeekHigh": _f(info.get("fiftyTwoWeekHigh")),
         "fiftyTwoWeekLow":  _f(info.get("fiftyTwoWeekLow")),
         "trailingPE":    _f(info.get("trailingPE")),
-        # yf provides forwardPE directly from analyst next-year consensus — use it as-is
-        "forwardPE":     _f(info.get("forwardPE")),
-        # trailingPegRatio = TTM P/E ÷ trailing EPS growth — this is what Yahoo shows
-        # on its own statistics page and is more stable than the forward pegRatio
+        # forwardPE: computed as price / forwardEps — never use yf's pre-computed
+        # forwardPE field because it can lag; always derive it from the live price
+        "forwardPE":     fwd_pe,
+        # trailingPegRatio = TTM P/E ÷ trailing EPS growth (what Yahoo's stat page shows)
         "pegRatio":      _f(info.get("trailingPegRatio") or info.get("pegRatio")),
         "priceToSalesTrailing12Months": _f(info.get("priceToSalesTrailing12Months")),
         "priceToBook":   _f(info.get("priceToBook")),
         "enterpriseToEbitda":  _f(info.get("enterpriseToEbitda")),
         "enterpriseToRevenue": _f(info.get("enterpriseToRevenue")),
         "trailingEps":     _f(info.get("trailingEps")),
-        # forwardEps from yf is analyst consensus for next fiscal year — correct source
-        "forwardEps":      _f(info.get("forwardEps")),
+        # forwardEps: ONLY from yf analyst consensus — no FMP fallback ever
+        "forwardEps":      fwd_eps,
         "targetMeanPrice": _f(info.get("targetMeanPrice")),
-        # priceDate: exchange-confirmed timestamp of the last traded price
-        "priceDate":       _price_date_str(info),
         "profitMargins":    _f(info.get("profitMargins")),
         "operatingMargins": _f(info.get("operatingMargins")),
         "grossMargins":     _f(info.get("grossMargins")),
@@ -458,7 +467,8 @@ def _yf_info_to_dict(info: dict) -> dict:
         "revenueGrowth":   _f(info.get("revenueGrowth")),
         "earningsGrowth":  _f(info.get("earningsGrowth")),
         "quarterlyRevenueGrowth": _f(info.get("revenueGrowth")),
-        "sharesOutstanding": _f(info.get("sharesOutstanding")),
+        "sharesOutstanding": shares,
+        "priceDate":         _price_date_str(info),
         "_source": "Yahoo Finance",
     }
 
@@ -466,15 +476,21 @@ def _yf_info_to_dict(info: dict) -> dict:
 @st.cache_data(ttl=900, show_spinner=False)
 def get_stock_info(ticker: str) -> dict:
     """
-    Fetch full company fundamentals. FMP is primary; yfinance is the automatic
-    silent fallback if FMP returns a 403 or plan/legacy error.
+    Fetch full company fundamentals.
+    FMP is primary for balance-sheet / ratio data (steps 1-6).
+    yfinance is mandatory for all forward-looking fields (step 7) because
+    FMP free-tier never exposes analyst EPS estimates.
+    yfinance is the automatic full fallback if FMP is blocked (403 / plan error).
 
-    FMP endpoints (non-legacy, available to all account tiers):
-      /profile, /quote, /ratios, /key-metrics, /income-statement,
-      /balance-sheet-statement
-
-    Yahoo Finance fallback:
-      yf.Ticker(ticker).info — provides the same key schema via _yf_info_to_dict
+    Forward metric sourcing rules (enforced in step 7 and the return dict):
+      forwardEps  — ONLY info.get("forwardEps") from yf.Ticker.info.
+                    Never falls back to FMP epsdiluted (historical data).
+      forwardPE   — computed as live_price / forwardEps.
+                    Never reuses trailingPE (TTM ratio).
+      pegRatio    — ONLY info.get("trailingPegRatio") from yf (TTM-based).
+                    Falls back to yf pegRatio; never uses FMP km.pegRatio.
+      marketCap   — live_price × sharesOutstanding (always current).
+      priceDate   — regularMarketTime timestamp from yf (exchange-confirmed).
     """
     def _f(v):
         try: return float(v) if v is not None else None
@@ -484,8 +500,7 @@ def get_stock_info(ticker: str) -> dict:
     # ── 1. FMP profile — the gating call ─────────────────────────────────────
     profile_data = _fmp_get(f"/profile/{ticker}", _ui_errors=True)
     if profile_data is _FMP_BLOCKED:
-        # FMP blocked → fall silently to Yahoo Finance
-        print(f"[Fallback] get_stock_info({ticker}) → Yahoo Finance")
+        print(f"[Fallback] get_stock_info({ticker}) → Yahoo Finance (FMP blocked)")
         st.info(f"ℹ️ Using backup data source for {ticker}", icon="ℹ️")
         try:
             info = yf.Ticker(ticker).info
@@ -543,32 +558,53 @@ def get_stock_info(ticker: str) -> dict:
     if bs_data and bs_data is not _FMP_BLOCKED and isinstance(bs_data, list):
         bs = bs_data[0]
 
-    # ── 7. Yahoo Finance — forward-looking analyst consensus data ────────────
-    # FMP free-tier never exposes analyst EPS estimates.  yf.Ticker.info always
-    # has forwardEps (next fiscal-year consensus), trailingPegRatio (TTM P/E ÷
-    # trailing growth), and regularMarketTime (exchange-confirmed price stamp).
-    # This call is NOT a fallback — it runs even when FMP succeeds, because
-    # these three fields CANNOT be sourced from FMP free-tier endpoints.
-    _yfi_fwd_eps  = None   # analyst next-FY EPS estimate
-    _yfi_fwd_pe   = None   # live_price / forwardEps  (computed below)
-    _yfi_peg      = None   # trailingPegRatio from yf
-    _yfi_price_dt = datetime.now().strftime("%Y-%m-%d")   # exchange timestamp
+    # ── 7. Yahoo Finance — mandatory forward-looking data ────────────────────
+    # This is NOT a fallback. It runs every time regardless of FMP success.
+    # FMP free-tier has no analyst estimate endpoints. yf is the only source
+    # for forwardEps, trailingPegRatio, and the exchange price timestamp.
+    #
+    # forwardEps:  info.get("forwardEps") — analyst next-fiscal-year consensus.
+    #              If this returns None (no coverage), we store None and show
+    #              N/A in the UI. We NEVER substitute FMP epsdiluted here.
+    # forwardPE:   computed as live_price / forwardEps — always from live price.
+    # pegRatio:    info.get("trailingPegRatio") — TTM P/E ÷ trailing EPS growth.
+    # priceDate:   regularMarketTime converted to ET string via _price_date_str.
+    # marketCap:   live_price × sharesOutstanding — always current, not stale.
+    _yfi_fwd_eps  = None
+    _yfi_fwd_pe   = None
+    _yfi_peg      = None
+    _yfi_price_dt = datetime.now().strftime("%Y-%m-%d")
+    _yfi_shares   = None
     try:
         _yfi = yf.Ticker(ticker).info
-        _yfi_fwd_eps = _f(_yfi.get("forwardEps"))
-        _yfi_peg     = _f(_yfi.get("trailingPegRatio") or _yfi.get("pegRatio"))
+        # ── forwardEps: analyst consensus only — no FMP fallback ─────────────
+        raw_fwd = _yfi.get("forwardEps")
+        _yfi_fwd_eps = _f(raw_fwd) if raw_fwd is not None else None
+        # ── pegRatio: trailingPegRatio preferred, then pegRatio ───────────────
+        _yfi_peg = _f(_yfi.get("trailingPegRatio") or _yfi.get("pegRatio"))
+        # ── priceDate from exchange timestamp ─────────────────────────────────
         _yfi_price_dt = _price_date_str(_yfi)
-        # Read price from already-fetched FMP quote/profile — no extra network call
+        # ── shares for marketCap calculation ──────────────────────────────────
+        _yfi_shares = _f(_yfi.get("sharesOutstanding"))
+        # ── forwardPE: live FMP price ÷ yf analyst forwardEps ─────────────────
         _tmp_price = _f(qt.get("price")) or _f(p.get("price"))
         if _yfi_fwd_eps and _yfi_fwd_eps > 0 and _tmp_price and _tmp_price > 0:
             _yfi_fwd_pe = round(_tmp_price / _yfi_fwd_eps, 2)
-        print(f"[yf fwd] {ticker}: fwdEps={_yfi_fwd_eps}, fwdPE={_yfi_fwd_pe}, peg={_yfi_peg}, dt={_yfi_price_dt}")
+        print(f"[yf fwd] {ticker}: fwdEps={_yfi_fwd_eps}, fwdPE={_yfi_fwd_pe}, "
+              f"peg={_yfi_peg}, dt={_yfi_price_dt}")
     except Exception as _yfi_exc:
         print(f"[yf fwd error] {ticker}: {_yfi_exc}")
 
-    # Live price: quote fresher than profile
+    # ── Derived price fields ──────────────────────────────────────────────────
     live_price = _f(qt.get("price")) or _f(p.get("price"))
     prev_close = _f(qt.get("previousClose")) or live_price
+
+    # marketCap = live price × shares — always in sync with current price
+    _shares_out = (_f(bs.get("commonStock") or p.get("sharesOutstanding"))
+                   or _yfi_shares)
+    _mkt_cap = (round(live_price * _shares_out)
+                if live_price and _shares_out
+                else (_f(qt.get("marketCap")) or _f(p.get("mktCap"))))
 
     wk52_high = _f(qt.get("yearHigh"))
     wk52_low  = _f(qt.get("yearLow"))
@@ -597,24 +633,22 @@ def get_stock_info(ticker: str) -> dict:
         "dayHigh":          _f(qt.get("dayHigh")),
         "dayLow":           _f(qt.get("dayLow")),
         "volume":           _f(qt.get("volume"))  or _f(p.get("volAvg")),
-        "marketCap":        _f(qt.get("marketCap")) or _f(p.get("mktCap")),
+        # marketCap = live_price × shares — always current, never a stale snapshot
+        "marketCap":        _mkt_cap,
         "beta":             _f(p.get("beta")),
         "fiftyTwoWeekHigh": wk52_high,
         "fiftyTwoWeekLow":  wk52_low,
         "trailingPE":  _r(ra.get("priceEarningsRatioTTM") or ra.get("priceEarningsRatio")),
-        # FIXED: forwardPE = live price ÷ analyst forward EPS (Step 7).
-        # Using TTM P/E here made Forward P/E identical to Trailing P/E — wrong.
+        # forwardPE = live_price / yf forwardEps (step 7) — never the TTM ratio
         "forwardPE":   _yfi_fwd_pe,
-        # FIXED: pegRatio from yf trailingPegRatio (Step 7).
-        # FMP key-metrics pegRatio is frequently null on free-tier accounts.
+        # pegRatio from yf trailingPegRatio (step 7) — FMP km.pegRatio is usually null
         "pegRatio":    _yfi_peg or _r(km.get("pegRatio")),
         "priceToSalesTrailing12Months": _r(ra.get("priceToSalesRatioTTM") or ra.get("priceToSalesRatio")),
         "priceToBook": _r(ra.get("priceToBookRatioTTM") or ra.get("priceToBookRatio")),
         "enterpriseToEbitda":  _r(km.get("enterpriseValueOverEBITDA")),
         "enterpriseToRevenue": _r(km.get("evToSales")),
         "trailingEps":     _f(inc.get("epsdiluted") or p.get("eps")),
-        # FIXED: forwardEps from yf analyst consensus (Step 7).
-        # inc.get("epsdiluted") is last reported historical EPS — never a forecast.
+        # forwardEps = yf analyst consensus (step 7) — NEVER FMP epsdiluted
         "forwardEps":      _yfi_fwd_eps,
         "targetMeanPrice": _f(p.get("dcf")),
         "profitMargins":    _r(ra.get("netProfitMarginTTM")       or ra.get("netProfitMargin")),
@@ -630,7 +664,7 @@ def get_stock_info(ticker: str) -> dict:
         "bookValue":    _f(km.get("bookValuePerShare")),
         "freeCashflow": (
             (_f(ra.get("freeCashFlowPerShareTTM") or ra.get("freeCashFlowPerShare")) or 0) *
-            (_f(bs.get("commonStock") or p.get("sharesOutstanding")) or 1)
+            (_shares_out or 1)
         ) if (ra.get("freeCashFlowPerShareTTM") or ra.get("freeCashFlowPerShare")) else None,
         "operatingCashflow": _f(inc.get("operatingCashFlow")),
         "totalRevenue":    _f(inc.get("revenue")    or p.get("revenue")),
@@ -640,8 +674,8 @@ def get_stock_info(ticker: str) -> dict:
         "revenueGrowth":   _rev_growth,
         "earningsGrowth":  _ni_growth,
         "quarterlyRevenueGrowth": _rev_growth,
-        "sharesOutstanding": _f(bs.get("commonStock") or p.get("sharesOutstanding")),
-        # priceDate: exchange-confirmed timestamp of the last traded price
+        "sharesOutstanding": _shares_out,
+        # priceDate: exchange-confirmed timestamp — tells you if price is live or yesterday
         "priceDate":   _yfi_price_dt,
         "_source": "FMP-v3",
     }
@@ -1633,40 +1667,41 @@ def page_analysis(run_analysis: bool) -> None:
             st.markdown("## 💰 Valuation Metrics")
             c1,c2,c3,c4 = st.columns(4)
             with c1: st.metric("Forward P/E",  fmt(info.get("forwardPE")),
-                                help="Current price ÷ analyst consensus forward EPS (next fiscal year). Source: Yahoo Finance.")
+                                help="Live price ÷ analyst consensus forward EPS (next fiscal year). Source: Yahoo Finance.")
             with c2: st.metric("P/E (TTM)",    fmt(info.get("trailingPE")),
-                                help="Price ÷ trailing 12-month EPS")
+                                help="Price ÷ trailing 12-month EPS. Source: FMP.")
             with c3: st.metric("PEG Ratio",    fmt(info.get("pegRatio")),
-                                help="Trailing P/E ÷ earnings growth rate. Source: Yahoo Finance trailingPegRatio. <1 = potentially undervalued.")
+                                help="Trailing P/E ÷ trailing EPS growth (trailingPegRatio). Source: Yahoo Finance. <1 = potentially undervalued.")
             with c4: st.metric("Price / Sales",fmt(info.get("priceToSalesTrailing12Months")),
-                                help="Market cap ÷ annual revenue")
-            # ── EPS row + Price Date ───────────────────────────────────────────
+                                help="Market cap ÷ annual revenue. Source: FMP.")
+            # ── EPS cards + Price Date ─────────────────────────────────────────
             e1,e2,e3,e4 = st.columns(4)
             with e1:
                 _fwd_e = info.get("forwardEps")
                 st.metric(
                     "Forward EPS",
-                    f"${float(_fwd_e):.2f}" if _fwd_e else "N/A",
-                    help="Analyst consensus next-fiscal-year EPS estimate. Source: Yahoo Finance forwardEps.",
+                    f"${float(_fwd_e):.2f}" if _fwd_e is not None else "N/A",
+                    help="Analyst consensus next-fiscal-year EPS. Source: Yahoo Finance forwardEps only — no FMP fallback.",
                 )
             with e2:
                 _ttm_e = info.get("trailingEps")
                 st.metric(
                     "Trailing EPS",
-                    f"${float(_ttm_e):.2f}" if _ttm_e else "N/A",
-                    help="Actual diluted EPS over the last 12 months. Source: FMP income-statement.",
+                    f"${float(_ttm_e):.2f}" if _ttm_e is not None else "N/A",
+                    help="Actual diluted EPS over the trailing 12 months. Source: FMP income-statement.",
                 )
             with e3:
                 st.metric("Price / Book", fmt(info.get("priceToBook")),
-                          help="Market price per share ÷ book value per share")
+                          help="Market price per share ÷ book value per share. Source: FMP.")
             with e4:
                 _pd_ui = info.get("priceDate", "—")
                 st.metric(
                     "Price Date",
                     _pd_ui,
                     help=(
-                        "Exchange-confirmed timestamp of the last traded price used in all ratio calculations. "
-                        "If this shows yesterday's date the market was closed and all ratios reflect the previous close."
+                        "Exchange-confirmed timestamp (ET) of the last traded price. "
+                        "All ratios are calculated from this price. "
+                        "Yesterday's date = market was closed; ratios reflect the previous close."
                     ),
                 )
 
