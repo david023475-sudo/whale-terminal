@@ -376,6 +376,26 @@ def _fmp_get(path: str, params: dict | None = None,
         return None
 
 # ─── yfinance normaliser ──────────────────────────────────────────────────────
+def _price_date_str(info: dict) -> str:
+    """
+    Extract the price timestamp from a yfinance .info dict and return a
+    human-readable string like '2025-03-04 16:00 ET'.
+    Falls back to today's date if no timestamp is available.
+    """
+    try:
+        import time as _time
+        ts = (info.get("regularMarketTime")
+              or info.get("lastTradeTime")
+              or info.get("tradeable"))   # int unix timestamp or None
+        if ts and isinstance(ts, (int, float)):
+            from datetime import timezone, timedelta
+            et = timezone(timedelta(hours=-5))   # Eastern Time (no DST adjustment needed for display)
+            dt = datetime.fromtimestamp(float(ts), tz=et)
+            return dt.strftime("%Y-%m-%d %H:%M ET")
+    except Exception:
+        pass
+    return datetime.now().strftime("%Y-%m-%d")   # graceful fallback
+
 def _yf_info_to_dict(info: dict) -> dict:
     """
     Convert a raw yfinance .info dict to the same key schema used by
@@ -404,15 +424,20 @@ def _yf_info_to_dict(info: dict) -> dict:
         "fiftyTwoWeekHigh": _f(info.get("fiftyTwoWeekHigh")),
         "fiftyTwoWeekLow":  _f(info.get("fiftyTwoWeekLow")),
         "trailingPE":    _f(info.get("trailingPE")),
+        # forwardPE: yfinance provides this directly from analyst consensus estimates
         "forwardPE":     _f(info.get("forwardPE")),
-        "pegRatio":      _f(info.get("pegRatio")),
+        # PEG: yfinance exposes both pegRatio (fwd) and trailingPegRatio (TTM-based)
+        "pegRatio":      _f(info.get("trailingPegRatio") or info.get("pegRatio")),
         "priceToSalesTrailing12Months": _f(info.get("priceToSalesTrailing12Months")),
         "priceToBook":   _f(info.get("priceToBook")),
         "enterpriseToEbitda":  _f(info.get("enterpriseToEbitda")),
         "enterpriseToRevenue": _f(info.get("enterpriseToRevenue")),
         "trailingEps":     _f(info.get("trailingEps")),
+        # forwardEps: analyst consensus next-fiscal-year EPS estimate from yfinance
         "forwardEps":      _f(info.get("forwardEps")),
         "targetMeanPrice": _f(info.get("targetMeanPrice")),
+        # priceDate: timestamp of the price used for all calculations
+        "priceDate": _price_date_str(info),
         "profitMargins":    _f(info.get("profitMargins")),
         "operatingMargins": _f(info.get("operatingMargins")),
         "grossMargins":     _f(info.get("grossMargins")),
@@ -518,6 +543,26 @@ def get_stock_info(ticker: str) -> dict:
     if bs_data and bs_data is not _FMP_BLOCKED and isinstance(bs_data, list):
         bs = bs_data[0]
 
+    # ── 7. Forward-looking data — analyst consensus via yfinance ─────────────
+    # FMP free tier does not expose analyst EPS estimates. yfinance provides
+    # forwardEps (next fiscal year consensus) and trailingPegRatio reliably.
+    # We fetch these regardless of whether FMP or yf is the primary source.
+    yf_fwd_eps  = None
+    yf_fwd_pe   = None
+    yf_peg      = None
+    yf_price_dt = datetime.now().strftime("%Y-%m-%d")
+    try:
+        _yf_info = yf.Ticker(ticker).info
+        yf_fwd_eps = _f(_yf_info.get("forwardEps"))
+        yf_peg     = _f(_yf_info.get("trailingPegRatio") or _yf_info.get("pegRatio"))
+        yf_price_dt = _price_date_str(_yf_info)
+        # Derive forwardPE from live price and analyst forward EPS
+        _live_for_fpe = _f(qt.get("price")) or _f(p.get("price"))
+        if yf_fwd_eps and yf_fwd_eps > 0 and _live_for_fpe:
+            yf_fwd_pe = round(_live_for_fpe / yf_fwd_eps, 2)
+    except Exception as _exc:
+        print(f"[yf fwd data] {ticker}: {_exc}")
+
     # Live price: quote fresher than profile
     live_price = _f(qt.get("price")) or _f(p.get("price"))
     prev_close = _f(qt.get("previousClose")) or live_price
@@ -554,14 +599,19 @@ def get_stock_info(ticker: str) -> dict:
         "fiftyTwoWeekHigh": wk52_high,
         "fiftyTwoWeekLow":  wk52_low,
         "trailingPE":  _r(ra.get("priceEarningsRatioTTM") or ra.get("priceEarningsRatio")),
-        "forwardPE":   _r(ra.get("priceEarningsRatioTTM") or ra.get("priceEarningsRatio")),
-        "pegRatio":    _r(km.get("pegRatio")),
+        # forwardPE: calculated as currentPrice / analyst forward EPS (from yfinance)
+        # never reuse the TTM P/E ratio for this field
+        "forwardPE":   yf_fwd_pe,
+        # pegRatio: FMP key-metrics pegRatio is often null; yf trailingPegRatio is reliable
+        "pegRatio":    yf_peg or _r(km.get("pegRatio")),
         "priceToSalesTrailing12Months": _r(ra.get("priceToSalesRatioTTM") or ra.get("priceToSalesRatio")),
         "priceToBook": _r(ra.get("priceToBookRatioTTM") or ra.get("priceToBookRatio")),
         "enterpriseToEbitda":  _r(km.get("enterpriseValueOverEBITDA")),
         "enterpriseToRevenue": _r(km.get("evToSales")),
         "trailingEps":     _f(inc.get("epsdiluted") or p.get("eps")),
-        "forwardEps":      _f(inc.get("epsdiluted") or p.get("eps")),
+        # forwardEps: analyst next-fiscal-year consensus from yfinance
+        # (never use historical income statement EPS for a forward estimate)
+        "forwardEps":      yf_fwd_eps,
         "targetMeanPrice": _f(p.get("dcf")),
         "profitMargins":    _r(ra.get("netProfitMarginTTM")       or ra.get("netProfitMargin")),
         "operatingMargins": _r(ra.get("operatingProfitMarginTTM") or ra.get("operatingProfitMargin")),
@@ -587,6 +637,8 @@ def get_stock_info(ticker: str) -> dict:
         "earningsGrowth":  _ni_growth,
         "quarterlyRevenueGrowth": _rev_growth,
         "sharesOutstanding": _f(bs.get("commonStock") or p.get("sharesOutstanding")),
+        # priceDate: timestamp of the price feeding all ratio calculations
+        "priceDate":   yf_price_dt,
         "_source": "FMP-v3",
     }
 # ── OHLCV history ─────────────────────────────────────────────────────────────
@@ -1567,20 +1619,54 @@ def page_analysis(run_analysis: bool) -> None:
                 lw = info.get("fiftyTwoWeekLow")
                 st.metric("52W Low",  f"${float(lw):.2f}" if lw else "N/A",
                            help="Lowest price in last 52 weeks")
-            st.caption(f"Source: **{src}** · Sector: **{sector}** · Industry: **{industry}** "
-                       f"· {datetime.now():%Y-%m-%d %H:%M:%S}")
+            _price_date = info.get("priceDate", datetime.now().strftime("%Y-%m-%d"))
+            st.caption(
+                f"Source: **{src}** · Sector: **{sector}** · Industry: **{industry}** "
+                f"· Price Date: **{_price_date}** · Fetched: {datetime.now():%Y-%m-%d %H:%M:%S}"
+            )
 
             # ── Valuation metrics ──────────────────────────────────────────────
             st.markdown("## 💰 Valuation Metrics")
             c1,c2,c3,c4 = st.columns(4)
             with c1: st.metric("Forward P/E",  fmt(info.get("forwardPE")),
-                                help="Price ÷ next-year EPS estimate")
+                                help="Current price ÷ analyst consensus forward EPS (next fiscal year)")
             with c2: st.metric("P/E (TTM)",    fmt(info.get("trailingPE")),
                                 help="Price ÷ trailing 12-month EPS")
             with c3: st.metric("PEG Ratio",    fmt(info.get("pegRatio")),
-                                help="P/E ÷ earnings growth rate. <1 = undervalued")
+                                help="Trailing P/E ÷ earnings growth rate. <1 = potentially undervalued")
             with c4: st.metric("Price / Sales",fmt(info.get("priceToSalesTrailing12Months")),
                                 help="Market cap ÷ annual revenue")
+            # ── EPS + Price Date row ───────────────────────────────────────────
+            e1,e2,e3,e4 = st.columns(4)
+            with e1:
+                fwd_eps = info.get("forwardEps")
+                st.metric(
+                    "Forward EPS",
+                    f"${float(fwd_eps):.2f}" if fwd_eps else "N/A",
+                    help="Analyst consensus next-fiscal-year EPS estimate (source: Yahoo Finance)",
+                )
+            with e2:
+                t_eps = info.get("trailingEps")
+                st.metric(
+                    "Trailing EPS",
+                    f"${float(t_eps):.2f}" if t_eps else "N/A",
+                    help="Actual diluted EPS over the last 12 months",
+                )
+            with e3:
+                pb = info.get("priceToBook")
+                st.metric("Price / Book", fmt(pb),
+                          help="Market price per share ÷ book value per share")
+            with e4:
+                _pd = info.get("priceDate", "—")
+                st.metric(
+                    "Price Date",
+                    _pd,
+                    help=(
+                        "Market timestamp of the price used in all ratio calculations. "
+                        "Yesterday's date = ratios are based on the previous closing price "
+                        "(market was closed when data was fetched)."
+                    ),
+                )
 
             # ── Quality score ──────────────────────────────────────────────────
             sc, desc, emoji = quality_score(info.get("returnOnEquity"), info.get("profitMargins"))
