@@ -186,7 +186,7 @@ if not GROQ_API_KEY:
 if GROQ_API_KEY:
     os.environ["GROQ_API_KEY"] = GROQ_API_KEY   # langchain-groq reads from env
     try:
-        llm = ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0)
+        llm = ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.1)
     except Exception as _llm_err:
         st.warning(f"Could not initialise Groq LLM: {_llm_err}")
         llm = None
@@ -404,20 +404,13 @@ def _yf_info_to_dict(info: dict) -> dict:
         "fiftyTwoWeekHigh": _f(info.get("fiftyTwoWeekHigh")),
         "fiftyTwoWeekLow":  _f(info.get("fiftyTwoWeekLow")),
         "trailingPE":    _f(info.get("trailingPE")),
-        # forwardPE: always computed as price / forwardEps — never use yf pre-baked value
-        "forwardPE":     (round(_f(info.get("currentPrice") or info.get("regularMarketPrice")) /
-                               _f(info.get("forwardEps")), 2)
-                          if (_f(info.get("forwardEps")) or 0) > 0
-                             and (_f(info.get("currentPrice") or info.get("regularMarketPrice")) or 0) > 0
-                          else None),
-        # trailingPegRatio is the TTM P/E-based PEG Yahoo shows on its own stats page
-        "pegRatio":      _f(info.get("trailingPegRatio") or info.get("pegRatio")),
+        "forwardPE":     _f(info.get("forwardPE")),
+        "pegRatio":      _f(info.get("pegRatio")),
         "priceToSalesTrailing12Months": _f(info.get("priceToSalesTrailing12Months")),
         "priceToBook":   _f(info.get("priceToBook")),
         "enterpriseToEbitda":  _f(info.get("enterpriseToEbitda")),
         "enterpriseToRevenue": _f(info.get("enterpriseToRevenue")),
         "trailingEps":     _f(info.get("trailingEps")),
-        # forwardEps: analyst next-fiscal-year consensus — no FMP fallback ever
         "forwardEps":      _f(info.get("forwardEps")),
         "targetMeanPrice": _f(info.get("targetMeanPrice")),
         "profitMargins":    _f(info.get("profitMargins")),
@@ -541,9 +534,7 @@ def get_stock_info(ticker: str) -> dict:
             except (ValueError, IndexError):
                 pass
 
-    # Build the result dict — forwardEps and forwardPE are intentionally
-    # left as None here; the hard-override block below sets them from yfinance.
-    info_dict = {
+    return {
         "symbol":   p.get("symbol"),
         "longName": p.get("companyName"),
         "sector":   p.get("sector"),
@@ -563,14 +554,14 @@ def get_stock_info(ticker: str) -> dict:
         "fiftyTwoWeekHigh": wk52_high,
         "fiftyTwoWeekLow":  wk52_low,
         "trailingPE":  _r(ra.get("priceEarningsRatioTTM") or ra.get("priceEarningsRatio")),
-        "forwardPE":   None,   # set by hard-override below — never from FMP
+        "forwardPE":   _r(ra.get("priceEarningsRatioTTM") or ra.get("priceEarningsRatio")),
         "pegRatio":    _r(km.get("pegRatio")),
         "priceToSalesTrailing12Months": _r(ra.get("priceToSalesRatioTTM") or ra.get("priceToSalesRatio")),
         "priceToBook": _r(ra.get("priceToBookRatioTTM") or ra.get("priceToBookRatio")),
         "enterpriseToEbitda":  _r(km.get("enterpriseValueOverEBITDA")),
         "enterpriseToRevenue": _r(km.get("evToSales")),
         "trailingEps":     _f(inc.get("epsdiluted") or p.get("eps")),
-        "forwardEps":      None,   # set by hard-override below — never from FMP
+        "forwardEps":      _f(inc.get("epsdiluted") or p.get("eps")),
         "targetMeanPrice": _f(p.get("dcf")),
         "profitMargins":    _r(ra.get("netProfitMarginTTM")       or ra.get("netProfitMargin")),
         "operatingMargins": _r(ra.get("operatingProfitMarginTTM") or ra.get("operatingProfitMargin")),
@@ -596,45 +587,8 @@ def get_stock_info(ticker: str) -> dict:
         "earningsGrowth":  _ni_growth,
         "quarterlyRevenueGrowth": _rev_growth,
         "sharesOutstanding": _f(bs.get("commonStock") or p.get("sharesOutstanding")),
-        "priceDate":   datetime.now().strftime("%Y-%m-%d"),   # overwritten below if yf succeeds
         "_source": "FMP-v3",
     }
-
-    # ── HARD OVERRIDE: forward metrics always come from yfinance ─────────────
-    # This block runs unconditionally and is the LAST thing that touches
-    # forwardEps and forwardPE before the dict is returned.
-    # It cannot be bypassed by FMP data because both keys were set to None above.
-    # If yfinance itself returns None for forwardEps, we store None — no FMP fallback.
-    try:
-        yf_data = yf.Ticker(ticker).info
-        # forwardEps: analyst next-fiscal-year consensus — the ONLY valid source
-        info_dict["forwardEps"] = yf_data.get("forwardEps")   # None if no coverage
-        # forwardPE: live price / forwardEps — always computed fresh
-        if info_dict["forwardEps"] and live_price:
-            info_dict["forwardPE"] = round(live_price / info_dict["forwardEps"], 2)
-        else:
-            info_dict["forwardPE"] = yf_data.get("forwardPE")  # yf pre-calc as last resort
-        # pegRatio: trailingPegRatio is what Yahoo's stats page shows
-        _yf_peg = yf_data.get("trailingPegRatio") or yf_data.get("pegRatio")
-        if _yf_peg is not None:
-            info_dict["pegRatio"] = float(_yf_peg)
-        # priceDate: exchange-confirmed timestamp of the last traded price
-        try:
-            ts = yf_data.get("regularMarketTime")
-            if ts and isinstance(ts, (int, float)):
-                from datetime import timezone, timedelta
-                dt = datetime.fromtimestamp(float(ts), tz=timezone(timedelta(hours=-5)))
-                info_dict["priceDate"] = dt.strftime("%Y-%m-%d %H:%M ET")
-        except Exception:
-            pass
-        print(f"[yf override] {ticker}: forwardEps={info_dict['forwardEps']}, "
-              f"forwardPE={info_dict['forwardPE']}, pegRatio={info_dict.get('pegRatio')}, "
-              f"priceDate={info_dict.get('priceDate')}")
-    except Exception as _ov_exc:
-        print(f"[yf override error] {ticker}: {_ov_exc}")
-        # forwardEps and forwardPE stay None — shown as N/A in UI, not as 10.68
-
-    return info_dict
 # ── OHLCV history ─────────────────────────────────────────────────────────────
 def _yf_history(ticker: str, period: str, interval: str) -> "pd.DataFrame":
     """Fetch OHLCV from Yahoo Finance and normalise to the same shape as FMP."""
@@ -876,18 +830,43 @@ def fmt(val, t="number"):
 
 # ── Technical indicators ──────────────────────────────────────────────────────
 def calc_rsi_macd_bb(hist):
+    """
+    Technical indicators.  RSI uses Wilder's Smoothing (EWM alpha=1/14) which
+    matches Yahoo Finance and TradingView exactly.  Requires at least 200 rows
+    of history for the warm-up period — always pass a 1-year (or longer) frame.
+    """
     try:
-        c=hist["Close"]; d=c.diff()
-        g=d.where(d>0,0).rolling(14).mean(); l=(-d.where(d<0,0)).rolling(14).mean()
-        rsi=100-(100/(1+g/l))
-        e1=c.ewm(span=12,adjust=False).mean(); e2=c.ewm(span=26,adjust=False).mean()
-        macd=e1-e2; sig=macd.ewm(span=9,adjust=False).mean()
-        s20=c.rolling(20).mean(); std20=c.rolling(20).std()
-        return {"rsi":rsi.iloc[-1],"macd":macd.iloc[-1],"signal":sig.iloc[-1],
-                "bb_upper":(s20+std20*2).iloc[-1],"bb_lower":(s20-std20*2).iloc[-1],
-                "sma_20":s20.iloc[-1],"sma_50":c.rolling(50).mean().iloc[-1],
-                "sma_200":c.rolling(200).mean().iloc[-1]}
-    except: return None
+        c = hist["Close"]
+        # ── RSI — Wilder's Smoothing (alpha = 1/14, adjust=False) ────────────
+        # This is the correct formula; simple rolling(14).mean() diverges when
+        # fewer than ~100 bars are available and gives wrong values (e.g. 53 vs 41).
+        d    = c.diff()
+        gain = d.where(d > 0, 0.0)
+        loss = (-d.where(d < 0, 0.0))
+        avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
+        rs  = avg_gain / avg_loss.replace(0, float("nan"))
+        rsi = 100 - (100 / (1 + rs))
+        # ── MACD ─────────────────────────────────────────────────────────────
+        e1   = c.ewm(span=12, adjust=False).mean()
+        e2   = c.ewm(span=26, adjust=False).mean()
+        macd = e1 - e2
+        sig  = macd.ewm(span=9, adjust=False).mean()
+        # ── Bollinger Bands ───────────────────────────────────────────────────
+        s20   = c.rolling(20).mean()
+        std20 = c.rolling(20).std()
+        return {
+            "rsi":       rsi.iloc[-1],
+            "macd":      macd.iloc[-1],
+            "signal":    sig.iloc[-1],
+            "bb_upper":  (s20 + std20 * 2).iloc[-1],
+            "bb_lower":  (s20 - std20 * 2).iloc[-1],
+            "sma_20":    s20.iloc[-1],
+            "sma_50":    c.rolling(50).mean().iloc[-1],
+            "sma_200":   c.rolling(200).mean().iloc[-1],
+        }
+    except:
+        return None
 
 def calc_atr(hist, period=14):
     try:
@@ -966,17 +945,37 @@ def calc_fair_value(info, hist, dg=0.20, dw=0.10):
                     dcfv = (pv + tv / (1 + dw) ** 5) / float(shr)
             except: pass
 
-        # ── 4. BLEND ──────────────────────────────────────────────────────────
-        if dcfv:
-            raw_fv = m_pe * 0.35 + m_fcf * 0.25 + dcfv * 0.25 + (at or m_pe) * 0.15
+        # ── 4. DCF SANITY CHECK ───────────────────────────────────────────────
+        # If the DCF intrinsic value is more than 70% below the current market
+        # price it is almost certainly an artefact of negative/tiny FCF
+        # (e.g. Amazon heavy-capex years, high-growth names with minimal FCF).
+        # In such cases we treat DCF as an outlier and exclude it from the
+        # blend entirely, using only the P/E model and analyst target instead.
+        dcf_outlier = False
+        if dcfv and cp > 0:
+            dcf_discount = (cp - dcfv) / cp   # positive = DCF below market
+            if dcf_discount > 0.70:           # DCF is >70% below market price
+                dcf_outlier = True
+                dcfv_blend  = None            # excluded from blend
+                print(f"[fair_value] DCF outlier detected: dcfv={dcfv:.2f}, "
+                      f"cp={cp:.2f}, discount={dcf_discount:.1%} — excluded from blend")
+            else:
+                dcfv_blend = dcfv
         else:
+            dcfv_blend = dcfv
+
+        # ── 5. BLEND ──────────────────────────────────────────────────────────
+        if dcfv_blend:
+            raw_fv = m_pe * 0.35 + m_fcf * 0.25 + dcfv_blend * 0.25 + (at or m_pe) * 0.15
+        else:
+            # DCF absent or outlier → weight entirely on P/E and analyst target
             raw_fv = m_pe * 0.45 + m_fcf * 0.25 + (at or m_pe) * 0.30
 
         # Quality premium: modest, capped at 8%
         qm     = 1.08 if roe > 0.40 else 1.04 if roe > 0.25 else 1.0
         raw_fv = raw_fv * qm
 
-        # ── 5. ANALYST GUARDRAIL ─────────────────────────────────────────────
+        # ── 6. ANALYST GUARDRAIL ─────────────────────────────────────────────
         analyst_adj = False
         if at and at > 0:
             dev = (raw_fv - at) / at          # positive = model higher than analyst
@@ -987,7 +986,7 @@ def calc_fair_value(info, hist, dg=0.20, dw=0.10):
 
         fv = raw_fv
 
-        # ── 6. BULL / BEAR — P/E anchored, capped ────────────────────────────
+        # ── 7. BULL / BEAR — P/E anchored, capped ────────────────────────────
         # Bull: apply a modest multiple expansion (max +15% above fair value, or analyst target)
         bull_pe_mult  = min(pe_mult * 1.15, pe_cap * 1.10)     # max 10% above cap
         bull_case     = max(eps * bull_pe_mult, fv * 1.10)
@@ -1006,10 +1005,10 @@ def calc_fair_value(info, hist, dg=0.20, dw=0.10):
         bear_case     = max(bear_case, cp * 0.75)              # floor: -25% from price
         bear_case     = min(bear_case, cp * 0.95)              # ceiling: at most -5%
 
-        # ── 7. UPSIDE — relative to current price ────────────────────────────
+        # ── 8. UPSIDE — relative to current price ────────────────────────────
         upside = ((fv / cp) - 1) * 100
 
-        # ── 8. TRANSPARENCY METADATA ─────────────────────────────────────────
+        # ── 9. TRANSPARENCY METADATA ─────────────────────────────────────────
         method_parts = [
             f"{pe_mult:.0f}x Fwd P/E",
             f"{tg*100:.1f}% terminal growth",
@@ -1018,13 +1017,16 @@ def calc_fair_value(info, hist, dg=0.20, dw=0.10):
             method_parts.append("analyst-adjusted (>20% deviation)")
         if is_megacap:
             method_parts.append("mega-cap P/E cap applied")
+        if dcf_outlier:
+            method_parts.append("DCF excluded (>70% below market — outlier)")
         method_str = " · ".join(method_parts)
 
         return {
             "fair_value":     fv,
             "peg_model":      m_pe,
             "fcf_model":      m_fcf,
-            "dcf_model":      dcfv,
+            "dcf_model":      dcfv,      # raw DCF (may be outlier — check dcf_outlier flag)
+            "dcf_outlier":    dcf_outlier,
             "analyst_target": at or 0.0,
             "upside":         upside,
             "bull_case":      bull_case,
@@ -1278,67 +1280,62 @@ def run_ai_agent(
         try: near_ath = (cp / float(h52)) > 0.95
         except: pass
 
+    # Minimal financial_data — only fields the prompt actively uses.
+    # Compact (no indent) to save ~30% of prompt tokens.
     financial_data = {
-        "ticker":           ticker,
-        "currentPrice":     round(cp, 2),
-        "fiftyTwoWeekHigh": fmt(h52),
-        "fiftyTwoWeekLow":  fmt(l52),
-        "nearAllTimeHigh":  near_ath,
-        "ATR_14d":          f"${atr:.2f}" if atr else "N/A",
-        "marketCap":        fmt(info.get("marketCap"), "money"),
-        "forwardPE":        fmt(info.get("forwardPE")),
-        "trailingPE":       fmt(info.get("trailingPE")),
-        "pegRatio":         fmt(info.get("pegRatio")),
-        "forwardEps":       fmt(info.get("forwardEps")),
-        "trailingEps":      fmt(info.get("trailingEps")),
-        "revenueGrowth":    fmt(info.get("revenueGrowth"),   "percent"),
-        "earningsGrowth":   fmt(info.get("earningsGrowth"),  "percent"),
-        "profitMargins":    fmt(info.get("profitMargins"),   "percent"),
-        "operatingMargins": fmt(info.get("operatingMargins"),"percent"),
-        "returnOnEquity":   fmt(info.get("returnOnEquity"),  "percent"),
-        "freeCashflow":     fmt(info.get("freeCashflow"),    "money"),
-        "debtToEquity":     fmt(info.get("debtToEquity")),
-        "beta":             fmt(info.get("beta")),
-        "RSI_14":           f"{rsi_v:.2f}" if isinstance(rsi_v,float) else "N/A",
-        "MACD_bias":        ("Bullish" if indicators and indicators["macd"]>indicators["signal"] else "Bearish") if indicators else "N/A",
-        "trend_200SMA":     ("Above" if cp>sma200 else "Below") if sma200 else "N/A",
-        "SMA_200":          f"${sma200:.2f}" if sma200 else "N/A",
-        "analystTarget":    fmt(info.get("targetMeanPrice")),
-        "blendedFairValue": f"${fv['fair_value']:.2f}" if fv else "N/A",
-        "fairValueUpside":  f"{fv['upside']:.1f}%" if fv else "N/A",
-        "DCF_value":        f"${fv['dcf_model']:.2f}" if fv and fv.get("dcf_model") else "N/A",
-        "bullCase":         f"${fv['bull_case']:.2f}" if fv else "N/A",
-        "bearCase":         f"${fv['bear_case']:.2f}" if fv else "N/A",
-        "peMultiple":       f"{fv['pe_multiple']:.0f}x" if fv else "N/A",
-        "terminalGrowth":   f"{fv['terminal_growth']:.1f}%" if fv else "N/A",
-        "analystAdjusted":  fv.get("analyst_adj", False) if fv else False,
-        "isMegaCap":        fv.get("is_megacap", False) if fv else False,
-        "sector":           info.get("sector","N/A"),
-        "industry":         info.get("industry","N/A"),
+        "tk": ticker,
+        "px": round(cp, 2),
+        "52H": fmt(h52),  "52L": fmt(l52),  "ATH": near_ath,
+        "atr": f"${atr:.2f}" if atr else "N/A",
+        "mcap": fmt(info.get("marketCap"), "money"),
+        "fwdPE": fmt(info.get("forwardPE")),
+        "ttmPE": fmt(info.get("trailingPE")),
+        "peg":   fmt(info.get("pegRatio")),
+        "fwdEps": fmt(info.get("forwardEps")),
+        "ttmEps": fmt(info.get("trailingEps")),
+        "revGr":  fmt(info.get("revenueGrowth"),  "percent"),
+        "epsGr":  fmt(info.get("earningsGrowth"), "percent"),
+        "pm":     fmt(info.get("profitMargins"),   "percent"),
+        "om":     fmt(info.get("operatingMargins"),"percent"),
+        "roe":    fmt(info.get("returnOnEquity"),  "percent"),
+        "fcf":    fmt(info.get("freeCashflow"),    "money"),
+        "d2e":    fmt(info.get("debtToEquity")),
+        "beta":   fmt(info.get("beta")),
+        "rsi":    f"{rsi_v:.2f}" if isinstance(rsi_v, float) else "N/A",
+        "macd":   ("Bull" if indicators and indicators["macd"]>indicators["signal"] else "Bear") if indicators else "N/A",
+        "sma200": ("Above" if cp > sma200 else "Below") if sma200 else "N/A",
+        "tgt":    fmt(info.get("targetMeanPrice")),
+        "fv":     f"${fv['fair_value']:.2f}" if fv else "N/A",
+        "fvUp":   f"{fv['upside']:.1f}%" if fv else "N/A",
+        "dcf":    (f"${fv['dcf_model']:.2f}" if fv and fv.get("dcf_model") and not fv.get("dcf_outlier") else "excl") if fv else "N/A",
+        "bull":   f"${fv['bull_case']:.2f}" if fv else "N/A",
+        "bear":   f"${fv['bear_case']:.2f}" if fv else "N/A",
+        "peM":    f"{fv['pe_multiple']:.0f}x" if fv else "N/A",
+        "sect":   info.get("sector","N/A"),
+        "ind":    info.get("industry","N/A"),
     }
 
-    # ── Source 2: news (include breaking flag) ────────────────────────────────
+    # ── Source 2: news — top 5 only to save tokens ───────────────────────────
     news_summary = []
-    for n in news[:8]:
+    for n in news[:5]:                          # hard cap: 5 headlines max
         entry = {
-            "headline":  n.get("title",""),
-            "sentiment": n.get("sentiment","Neutral"),
-            "score":     round(n.get("score",0.5),2),
-            "reason":    n.get("reason",""),
-            "date":      n.get("published",""),
-            "breaking":  n.get("breaking",False),
+            "h":  n.get("title","")[:120],      # truncate long headlines
+            "s":  n.get("sentiment","Neutral")[0],  # B/N/Be (1 char)
+            "sc": round(n.get("score",0.5),2),
         }
+        if n.get("breaking"):
+            entry["brk"] = True
         if n.get("hours_ago") is not None:
-            entry["hours_ago"] = f"{n['hours_ago']:.1f}h ago"
+            entry["age"] = f"{n['hours_ago']:.0f}h"
         news_summary.append(entry)
 
-    bull_n = sum(1 for n in news if n.get("sentiment")=="Bullish")
-    bear_n = sum(1 for n in news if n.get("sentiment")=="Bearish")
+    bull_n         = sum(1 for n in news if n.get("sentiment")=="Bullish")
+    bear_n         = sum(1 for n in news if n.get("sentiment")=="Bearish")
     breaking_count = sum(1 for n in news if n.get("breaking"))
     news_summary_obj = {
-        "headlines":       news_summary,
-        "summary":         f"{bull_n} Bullish / {bear_n} Bearish / {len(news)-bull_n-bear_n} Neutral",
-        "breaking_alerts": breaking_count,
+        "top5":    news_summary,
+        "sent":    f"{bull_n}B/{bear_n}Be/{len(news)-bull_n-bear_n}N",
+        "brk":     breaking_count,
     }
 
     # ── Source 3: earnings context ────────────────────────────────────────────
@@ -1391,12 +1388,14 @@ def run_ai_agent(
             "Add it to `.streamlit/secrets.toml` or your Streamlit Cloud Secrets panel "
             "to enable the AI agent."
         )
+    # Compact JSON serialisation — no indent, no extra whitespace.
+    # Saves ~25-35% prompt tokens vs indent=2 on large dicts.
     prompt = AGENT_PROMPT.format(
         date=datetime.now().strftime("%B %d, %Y"),
-        financial_data=json.dumps(financial_data, indent=2),
-        news_data=json.dumps(news_summary_obj, indent=2),
-        earnings_data=json.dumps(earnings_data, indent=2),
-        prediction_data=json.dumps(prediction_data, indent=2),
+        financial_data=json.dumps(financial_data, separators=(",", ":")),
+        news_data=json.dumps(news_summary_obj, separators=(",", ":")),
+        earnings_data=json.dumps(earnings_data, separators=(",", ":")),
+        prediction_data=json.dumps(prediction_data, separators=(",", ":")),
     )
     verdict = llm.invoke(prompt).content
     return verdict
@@ -1613,49 +1612,20 @@ def page_analysis(run_analysis: bool) -> None:
                 lw = info.get("fiftyTwoWeekLow")
                 st.metric("52W Low",  f"${float(lw):.2f}" if lw else "N/A",
                            help="Lowest price in last 52 weeks")
-            _ui_pd = info.get("priceDate", datetime.now().strftime("%Y-%m-%d"))
-            st.caption(
-                f"Source: **{src}** · Sector: **{sector}** · Industry: **{industry}** "
-                f"· Price Date: **{_ui_pd}** · Fetched: {datetime.now():%Y-%m-%d %H:%M:%S}"
-            )
+            st.caption(f"Source: **{src}** · Sector: **{sector}** · Industry: **{industry}** "
+                       f"· {datetime.now():%Y-%m-%d %H:%M:%S}")
 
             # ── Valuation metrics ──────────────────────────────────────────────
             st.markdown("## 💰 Valuation Metrics")
             c1,c2,c3,c4 = st.columns(4)
             with c1: st.metric("Forward P/E",  fmt(info.get("forwardPE")),
-                                help="Live price ÷ analyst forward EPS. Source: Yahoo Finance only.")
+                                help="Price ÷ next-year EPS estimate")
             with c2: st.metric("P/E (TTM)",    fmt(info.get("trailingPE")),
                                 help="Price ÷ trailing 12-month EPS")
             with c3: st.metric("PEG Ratio",    fmt(info.get("pegRatio")),
-                                help="Trailing P/E ÷ EPS growth (trailingPegRatio). Source: Yahoo Finance.")
+                                help="P/E ÷ earnings growth rate. <1 = undervalued")
             with c4: st.metric("Price / Sales",fmt(info.get("priceToSalesTrailing12Months")),
                                 help="Market cap ÷ annual revenue")
-            # ── EPS cards + Price Date ─────────────────────────────────────────
-            e1,e2,e3,e4 = st.columns(4)
-            with e1:
-                _fwd_e = info.get("forwardEps")
-                st.metric(
-                    "Forward EPS",
-                    f"${float(_fwd_e):.2f}" if _fwd_e is not None else "N/A",
-                    help="Yahoo Finance forwardEps only. N/A = no analyst coverage. Never sourced from FMP.",
-                )
-            with e2:
-                _ttm_e = info.get("trailingEps")
-                st.metric(
-                    "Trailing EPS",
-                    f"${float(_ttm_e):.2f}" if _ttm_e is not None else "N/A",
-                    help="Actual diluted EPS — trailing 12 months. Source: FMP income-statement.",
-                )
-            with e3:
-                st.metric("Price / Book", fmt(info.get("priceToBook")),
-                          help="Market price ÷ book value per share")
-            with e4:
-                _pd_val = info.get("priceDate", "—")
-                st.metric(
-                    "Price Date",
-                    _pd_val,
-                    help="Exchange-confirmed timestamp of the price used in all ratio calculations.",
-                )
 
             # ── Quality score ──────────────────────────────────────────────────
             sc, desc, emoji = quality_score(info.get("returnOnEquity"), info.get("profitMargins"))
@@ -1669,7 +1639,11 @@ def page_analysis(run_analysis: bool) -> None:
 
             # ── Candlestick chart — interactive with toggleable indicators ──────
             st.markdown("## 📊 Technical Analysis")
-            indicators = calc_rsi_macd_bb(hist)
+            # RSI requires ≥200 bars for Wilder's warm-up to stabilise.
+            # Always fetch a 1-year daily series for indicator calculations,
+            # regardless of the display timeframe selected by the user.
+            _rsi_hist = get_stock_history(ticker, "1y", "1d")
+            indicators = calc_rsi_macd_bb(_rsi_hist if not _rsi_hist.empty else hist)
 
             # Indicator toggle controls — stored in session_state so they survive reruns
             ind_defaults = st.session_state.get("chart_indicators", ["SMA 50","SMA 200"])
@@ -1783,11 +1757,14 @@ def page_analysis(run_analysis: bool) -> None:
 
             # ── Rows 3 & 4: RSI + MACD ────────────────────────────────────────
             if show_studies and indicators:
-                close   = hist["Close"]
-                delta   = close.diff()
-                gain    = delta.where(delta > 0, 0).rolling(14).mean()
-                loss    = (-delta.where(delta < 0, 0)).rolling(14).mean()
-                rsi_ser = 100 - (100 / (1 + gain / loss))
+                close     = hist["Close"]
+                delta     = close.diff()
+                _gain     = delta.where(delta > 0, 0.0)
+                _loss     = (-delta.where(delta < 0, 0.0))
+                _avg_gain = _gain.ewm(alpha=1/14, adjust=False).mean()
+                _avg_loss = _loss.ewm(alpha=1/14, adjust=False).mean()
+                _rs       = _avg_gain / _avg_loss.replace(0, float("nan"))
+                rsi_ser   = 100 - (100 / (1 + _rs))
 
                 # RSI
                 rsi_colors = []
