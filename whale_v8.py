@@ -120,83 +120,116 @@ hr { border:none; height:1px;
 .stRadio > label { display:none; }
 </style>""", unsafe_allow_html=True)
 
-# ── Phone Mode CSS — injected dynamically based on sidebar toggle ─────────────
-# Reads from session_state (set by the sidebar toggle above on first render;
-# uses .get() with False default so it never errors on a cold first load).
+# ── Phone Mode — injected on every render when toggle is ON ──────────────────
+# Uses session_state so it survives reruns. When OFF, zero extra CSS is added.
 if st.session_state.get("phone_mode", False):
     st.markdown("""<style>
-/* ── Phone Mode: constrain app to 400px, centred, with side gutters ── */
+/* ════════════════════════════════════════════════════════════════════════════
+   PHONE MODE — simulates a mobile browser at 450px
+   All rules use !important to override Streamlit's own responsive styles.
+   When the toggle is OFF this entire block is never injected.
+   ════════════════════════════════════════════════════════════════════════════ */
 
-/* 1. Outer shell — dark gutter on both sides */
+/* 1. Outer shell — solid dark gutter on both sides so the frame stands out */
 [data-testid="stApp"] {
-    background-color: #060810 !important;
+    background-color: #0e1117 !important;
 }
 
-/* 2. Main content column — fixed 400px, centred */
+/* 2. Main content column — max 450px, centred, with phone-screen chrome */
 [data-testid="stAppViewContainer"] {
-    max-width: 400px !important;
-    width: 400px !important;
-    margin-left: auto !important;
-    margin-right: auto !important;
-    /* Phone-screen border + glow */
+    max-width:    450px !important;
+    width:        450px !important;
+    margin-left:  auto  !important;
+    margin-right: auto  !important;
+    background-color: #080c1a !important;
     border-left:  1px solid #2a3550 !important;
     border-right: 1px solid #2a3550 !important;
     box-shadow:
-        0 0 0 1px rgba(88,166,255,0.08),
-        0 0 60px rgba(0,0,0,0.85),
-        inset 0 0 30px rgba(8,12,26,0.4) !important;
-    min-height: 100vh;
+        0 0 0 1px rgba(88,166,255,0.06),
+        0 0 80px rgba(0,0,0,0.9) !important;
+    min-height: 100vh !important;
 }
 
-/* 3. Inner block container — no extra padding that breaks 400px */
-[data-testid="stAppViewBlockContainer"] {
-    max-width: 400px !important;
-    padding-left:  12px !important;
-    padding-right: 12px !important;
+/* 3. Inner block container — tighter horizontal padding */
+[data-testid="stAppViewBlockContainer"],
+.block-container {
+    max-width:     450px !important;
+    padding-left:  16px  !important;
+    padding-right: 16px  !important;
+    box-sizing:    border-box !important;
 }
 
-/* 4. All Plotly charts — horizontal scroll inside 400px */
-[data-testid="stPlotlyChart"],
-.stPlotlyChart,
-div[class*="stPlotlyChart"] {
-    overflow-x: auto !important;
-    max-width: 376px !important;   /* 400 - 2×12px padding */
+/* 4. FORCE COLUMN STACKING — most important rule for phone feel.
+      Streamlit renders st.columns as flex children; setting flex-direction
+      column on the parent makes them stack vertically like a real mobile page. */
+[data-testid="stHorizontalBlock"] {
+    flex-direction: column !important;
+    gap: 8px !important;
 }
 
-/* 5. Dataframes / tables — horizontal scroll inside 400px */
-[data-testid="stDataFrame"],
-[data-testid="stTable"],
-div[class*="stDataFrame"],
-div[class*="stTable"] {
-    overflow-x: auto !important;
-    max-width: 376px !important;
-    display: block !important;
+/* 5. Each column child takes full width when stacked */
+[data-testid="column"] {
+    width:     100% !important;
+    min-width: 100% !important;
+    flex:      1 1 100% !important;
+    max-width: 100% !important;
 }
 
-/* 6. Metric cards — stack to full width in phone view */
+/* 6. Metric cards — full width, no overflow */
 div[data-testid="stMetric"] {
-    min-width: 0 !important;
-    width: 100% !important;
+    width:      100% !important;
+    min-width:  0   !important;
     box-sizing: border-box !important;
 }
 
-/* 7. Column containers — allow wrapping so columns stack vertically */
-[data-testid="column"] {
-    min-width: 0 !important;
-    overflow-x: hidden !important;
+/* 7. Charts — fill the column and scroll horizontally if too wide */
+img,
+[data-testid="stPlotlyChart"],
+.stPlotlyChart,
+div[class*="stPlotlyChart"] {
+    width:      100% !important;
+    max-width:  418px !important;   /* 450 − 2×16px padding */
+    overflow-x: auto !important;
 }
 
-/* 8. Sidebar stays off-screen (collapsed) — phone UX */
-section[data-testid="stSidebar"] {
-    width: 260px !important;
+/* 8. Dataframes / tables — horizontal scroll, never overflow */
+[data-testid="stDataFrame"],
+[data-testid="stTable"],
+div[class*="stDataFrame"] {
+    width:      100% !important;
+    max-width:  418px !important;
+    overflow-x: auto !important;
+    display:    block !important;
 }
 
-/* 9. Horizontal rule / dividers — respect 400px */
-hr { max-width: 376px !important; }
+/* 9. Tab list — allow wrapping so tab labels don't overflow */
+.stTabs [data-baseweb="tab-list"] {
+    flex-wrap:  wrap !important;
+    gap:        4px  !important;
+}
+.stTabs [data-baseweb="tab"] {
+    font-size: 0.78rem !important;
+    padding:   6px 10px !important;
+}
 
-/* 10. Input fields */
-.stTextInput input, .stSelectbox select {
-    font-size: 16px !important;   /* prevent iOS zoom-on-focus */
+/* 10. Font scaling — slightly tighter for phone density */
+html {
+    font-size: 14px !important;
+}
+div[data-testid="stMetricValue"] {
+    font-size: 1.3rem !important;
+}
+
+/* 11. Input fields — 16px prevents iOS Safari auto-zoom on focus */
+input, textarea, select,
+.stTextInput input,
+.stSelectbox select {
+    font-size: 16px !important;
+}
+
+/* 12. Horizontal rules — stay within padded container */
+hr {
+    max-width: 418px !important;
 }
 </style>""", unsafe_allow_html=True)
 
@@ -364,7 +397,7 @@ with st.sidebar:
         "📱 Phone Mode",
         value=st.session_state.get("phone_mode", False),
         key="phone_mode_toggle",
-        help="Constrain app to 400px — mirrors a mobile phone screen.",
+        help="Simulate a mobile browser view — 450px wide, columns stack vertically.",
     )
     st.session_state["phone_mode"] = phone_mode
     st.markdown("---")
