@@ -120,6 +120,86 @@ hr { border:none; height:1px;
 .stRadio > label { display:none; }
 </style>""", unsafe_allow_html=True)
 
+# ── Phone Mode CSS — injected dynamically based on sidebar toggle ─────────────
+# Reads from session_state (set by the sidebar toggle above on first render;
+# uses .get() with False default so it never errors on a cold first load).
+if st.session_state.get("phone_mode", False):
+    st.markdown("""<style>
+/* ── Phone Mode: constrain app to 400px, centred, with side gutters ── */
+
+/* 1. Outer shell — dark gutter on both sides */
+[data-testid="stApp"] {
+    background-color: #060810 !important;
+}
+
+/* 2. Main content column — fixed 400px, centred */
+[data-testid="stAppViewContainer"] {
+    max-width: 400px !important;
+    width: 400px !important;
+    margin-left: auto !important;
+    margin-right: auto !important;
+    /* Phone-screen border + glow */
+    border-left:  1px solid #2a3550 !important;
+    border-right: 1px solid #2a3550 !important;
+    box-shadow:
+        0 0 0 1px rgba(88,166,255,0.08),
+        0 0 60px rgba(0,0,0,0.85),
+        inset 0 0 30px rgba(8,12,26,0.4) !important;
+    min-height: 100vh;
+}
+
+/* 3. Inner block container — no extra padding that breaks 400px */
+[data-testid="stAppViewBlockContainer"] {
+    max-width: 400px !important;
+    padding-left:  12px !important;
+    padding-right: 12px !important;
+}
+
+/* 4. All Plotly charts — horizontal scroll inside 400px */
+[data-testid="stPlotlyChart"],
+.stPlotlyChart,
+div[class*="stPlotlyChart"] {
+    overflow-x: auto !important;
+    max-width: 376px !important;   /* 400 - 2×12px padding */
+}
+
+/* 5. Dataframes / tables — horizontal scroll inside 400px */
+[data-testid="stDataFrame"],
+[data-testid="stTable"],
+div[class*="stDataFrame"],
+div[class*="stTable"] {
+    overflow-x: auto !important;
+    max-width: 376px !important;
+    display: block !important;
+}
+
+/* 6. Metric cards — stack to full width in phone view */
+div[data-testid="stMetric"] {
+    min-width: 0 !important;
+    width: 100% !important;
+    box-sizing: border-box !important;
+}
+
+/* 7. Column containers — allow wrapping so columns stack vertically */
+[data-testid="column"] {
+    min-width: 0 !important;
+    overflow-x: hidden !important;
+}
+
+/* 8. Sidebar stays off-screen (collapsed) — phone UX */
+section[data-testid="stSidebar"] {
+    width: 260px !important;
+}
+
+/* 9. Horizontal rule / dividers — respect 400px */
+hr { max-width: 376px !important; }
+
+/* 10. Input fields */
+.stTextInput input, .stSelectbox select {
+    font-size: 16px !important;   /* prevent iOS zoom-on-focus */
+}
+</style>""", unsafe_allow_html=True)
+
 # ===================== CONFIG — secrets via st.secrets =======================
 # ─────────────────────────────────────────────────────────────────────────────
 # HARDCODED FALLBACKS — edit these if st.secrets is not loading correctly.
@@ -186,7 +266,7 @@ if not GROQ_API_KEY:
 if GROQ_API_KEY:
     os.environ["GROQ_API_KEY"] = GROQ_API_KEY   # langchain-groq reads from env
     try:
-        llm = ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.1)
+        llm = ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0)
     except Exception as _llm_err:
         st.warning(f"Could not initialise Groq LLM: {_llm_err}")
         llm = None
@@ -279,6 +359,14 @@ with st.sidebar:
         run_analysis = st.button("🚀 RUN ANALYSIS",type="primary",use_container_width=True)
         st.markdown("---")
         render_watchlist_sidebar(wm, USER_ID, st.session_state["analysis_ticker"])
+    st.markdown("---")
+    phone_mode = st.toggle(
+        "📱 Phone Mode",
+        value=st.session_state.get("phone_mode", False),
+        key="phone_mode_toggle",
+        help="Constrain app to 400px — mirrors a mobile phone screen.",
+    )
+    st.session_state["phone_mode"] = phone_mode
     st.markdown("---")
     if st.button("🚪 Sign Out",use_container_width=True,key="so_btn"):
         auth.sign_out(); st.rerun()
@@ -830,43 +918,18 @@ def fmt(val, t="number"):
 
 # ── Technical indicators ──────────────────────────────────────────────────────
 def calc_rsi_macd_bb(hist):
-    """
-    Technical indicators.  RSI uses Wilder's Smoothing (EWM alpha=1/14) which
-    matches Yahoo Finance and TradingView exactly.  Requires at least 200 rows
-    of history for the warm-up period — always pass a 1-year (or longer) frame.
-    """
     try:
-        c = hist["Close"]
-        # ── RSI — Wilder's Smoothing (alpha = 1/14, adjust=False) ────────────
-        # This is the correct formula; simple rolling(14).mean() diverges when
-        # fewer than ~100 bars are available and gives wrong values (e.g. 53 vs 41).
-        d    = c.diff()
-        gain = d.where(d > 0, 0.0)
-        loss = (-d.where(d < 0, 0.0))
-        avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
-        avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
-        rs  = avg_gain / avg_loss.replace(0, float("nan"))
-        rsi = 100 - (100 / (1 + rs))
-        # ── MACD ─────────────────────────────────────────────────────────────
-        e1   = c.ewm(span=12, adjust=False).mean()
-        e2   = c.ewm(span=26, adjust=False).mean()
-        macd = e1 - e2
-        sig  = macd.ewm(span=9, adjust=False).mean()
-        # ── Bollinger Bands ───────────────────────────────────────────────────
-        s20   = c.rolling(20).mean()
-        std20 = c.rolling(20).std()
-        return {
-            "rsi":       rsi.iloc[-1],
-            "macd":      macd.iloc[-1],
-            "signal":    sig.iloc[-1],
-            "bb_upper":  (s20 + std20 * 2).iloc[-1],
-            "bb_lower":  (s20 - std20 * 2).iloc[-1],
-            "sma_20":    s20.iloc[-1],
-            "sma_50":    c.rolling(50).mean().iloc[-1],
-            "sma_200":   c.rolling(200).mean().iloc[-1],
-        }
-    except:
-        return None
+        c=hist["Close"]; d=c.diff()
+        g=d.where(d>0,0).rolling(14).mean(); l=(-d.where(d<0,0)).rolling(14).mean()
+        rsi=100-(100/(1+g/l))
+        e1=c.ewm(span=12,adjust=False).mean(); e2=c.ewm(span=26,adjust=False).mean()
+        macd=e1-e2; sig=macd.ewm(span=9,adjust=False).mean()
+        s20=c.rolling(20).mean(); std20=c.rolling(20).std()
+        return {"rsi":rsi.iloc[-1],"macd":macd.iloc[-1],"signal":sig.iloc[-1],
+                "bb_upper":(s20+std20*2).iloc[-1],"bb_lower":(s20-std20*2).iloc[-1],
+                "sma_20":s20.iloc[-1],"sma_50":c.rolling(50).mean().iloc[-1],
+                "sma_200":c.rolling(200).mean().iloc[-1]}
+    except: return None
 
 def calc_atr(hist, period=14):
     try:
@@ -945,37 +1008,17 @@ def calc_fair_value(info, hist, dg=0.20, dw=0.10):
                     dcfv = (pv + tv / (1 + dw) ** 5) / float(shr)
             except: pass
 
-        # ── 4. DCF SANITY CHECK ───────────────────────────────────────────────
-        # If the DCF intrinsic value is more than 70% below the current market
-        # price it is almost certainly an artefact of negative/tiny FCF
-        # (e.g. Amazon heavy-capex years, high-growth names with minimal FCF).
-        # In such cases we treat DCF as an outlier and exclude it from the
-        # blend entirely, using only the P/E model and analyst target instead.
-        dcf_outlier = False
-        if dcfv and cp > 0:
-            dcf_discount = (cp - dcfv) / cp   # positive = DCF below market
-            if dcf_discount > 0.70:           # DCF is >70% below market price
-                dcf_outlier = True
-                dcfv_blend  = None            # excluded from blend
-                print(f"[fair_value] DCF outlier detected: dcfv={dcfv:.2f}, "
-                      f"cp={cp:.2f}, discount={dcf_discount:.1%} — excluded from blend")
-            else:
-                dcfv_blend = dcfv
+        # ── 4. BLEND ──────────────────────────────────────────────────────────
+        if dcfv:
+            raw_fv = m_pe * 0.35 + m_fcf * 0.25 + dcfv * 0.25 + (at or m_pe) * 0.15
         else:
-            dcfv_blend = dcfv
-
-        # ── 5. BLEND ──────────────────────────────────────────────────────────
-        if dcfv_blend:
-            raw_fv = m_pe * 0.35 + m_fcf * 0.25 + dcfv_blend * 0.25 + (at or m_pe) * 0.15
-        else:
-            # DCF absent or outlier → weight entirely on P/E and analyst target
             raw_fv = m_pe * 0.45 + m_fcf * 0.25 + (at or m_pe) * 0.30
 
         # Quality premium: modest, capped at 8%
         qm     = 1.08 if roe > 0.40 else 1.04 if roe > 0.25 else 1.0
         raw_fv = raw_fv * qm
 
-        # ── 6. ANALYST GUARDRAIL ─────────────────────────────────────────────
+        # ── 5. ANALYST GUARDRAIL ─────────────────────────────────────────────
         analyst_adj = False
         if at and at > 0:
             dev = (raw_fv - at) / at          # positive = model higher than analyst
@@ -986,7 +1029,7 @@ def calc_fair_value(info, hist, dg=0.20, dw=0.10):
 
         fv = raw_fv
 
-        # ── 7. BULL / BEAR — P/E anchored, capped ────────────────────────────
+        # ── 6. BULL / BEAR — P/E anchored, capped ────────────────────────────
         # Bull: apply a modest multiple expansion (max +15% above fair value, or analyst target)
         bull_pe_mult  = min(pe_mult * 1.15, pe_cap * 1.10)     # max 10% above cap
         bull_case     = max(eps * bull_pe_mult, fv * 1.10)
@@ -1005,10 +1048,10 @@ def calc_fair_value(info, hist, dg=0.20, dw=0.10):
         bear_case     = max(bear_case, cp * 0.75)              # floor: -25% from price
         bear_case     = min(bear_case, cp * 0.95)              # ceiling: at most -5%
 
-        # ── 8. UPSIDE — relative to current price ────────────────────────────
+        # ── 7. UPSIDE — relative to current price ────────────────────────────
         upside = ((fv / cp) - 1) * 100
 
-        # ── 9. TRANSPARENCY METADATA ─────────────────────────────────────────
+        # ── 8. TRANSPARENCY METADATA ─────────────────────────────────────────
         method_parts = [
             f"{pe_mult:.0f}x Fwd P/E",
             f"{tg*100:.1f}% terminal growth",
@@ -1017,16 +1060,13 @@ def calc_fair_value(info, hist, dg=0.20, dw=0.10):
             method_parts.append("analyst-adjusted (>20% deviation)")
         if is_megacap:
             method_parts.append("mega-cap P/E cap applied")
-        if dcf_outlier:
-            method_parts.append("DCF excluded (>70% below market — outlier)")
         method_str = " · ".join(method_parts)
 
         return {
             "fair_value":     fv,
             "peg_model":      m_pe,
             "fcf_model":      m_fcf,
-            "dcf_model":      dcfv,      # raw DCF (may be outlier — check dcf_outlier flag)
-            "dcf_outlier":    dcf_outlier,
+            "dcf_model":      dcfv,
             "analyst_target": at or 0.0,
             "upside":         upside,
             "bull_case":      bull_case,
@@ -1280,62 +1320,67 @@ def run_ai_agent(
         try: near_ath = (cp / float(h52)) > 0.95
         except: pass
 
-    # Minimal financial_data — only fields the prompt actively uses.
-    # Compact (no indent) to save ~30% of prompt tokens.
     financial_data = {
-        "tk": ticker,
-        "px": round(cp, 2),
-        "52H": fmt(h52),  "52L": fmt(l52),  "ATH": near_ath,
-        "atr": f"${atr:.2f}" if atr else "N/A",
-        "mcap": fmt(info.get("marketCap"), "money"),
-        "fwdPE": fmt(info.get("forwardPE")),
-        "ttmPE": fmt(info.get("trailingPE")),
-        "peg":   fmt(info.get("pegRatio")),
-        "fwdEps": fmt(info.get("forwardEps")),
-        "ttmEps": fmt(info.get("trailingEps")),
-        "revGr":  fmt(info.get("revenueGrowth"),  "percent"),
-        "epsGr":  fmt(info.get("earningsGrowth"), "percent"),
-        "pm":     fmt(info.get("profitMargins"),   "percent"),
-        "om":     fmt(info.get("operatingMargins"),"percent"),
-        "roe":    fmt(info.get("returnOnEquity"),  "percent"),
-        "fcf":    fmt(info.get("freeCashflow"),    "money"),
-        "d2e":    fmt(info.get("debtToEquity")),
-        "beta":   fmt(info.get("beta")),
-        "rsi":    f"{rsi_v:.2f}" if isinstance(rsi_v, float) else "N/A",
-        "macd":   ("Bull" if indicators and indicators["macd"]>indicators["signal"] else "Bear") if indicators else "N/A",
-        "sma200": ("Above" if cp > sma200 else "Below") if sma200 else "N/A",
-        "tgt":    fmt(info.get("targetMeanPrice")),
-        "fv":     f"${fv['fair_value']:.2f}" if fv else "N/A",
-        "fvUp":   f"{fv['upside']:.1f}%" if fv else "N/A",
-        "dcf":    (f"${fv['dcf_model']:.2f}" if fv and fv.get("dcf_model") and not fv.get("dcf_outlier") else "excl") if fv else "N/A",
-        "bull":   f"${fv['bull_case']:.2f}" if fv else "N/A",
-        "bear":   f"${fv['bear_case']:.2f}" if fv else "N/A",
-        "peM":    f"{fv['pe_multiple']:.0f}x" if fv else "N/A",
-        "sect":   info.get("sector","N/A"),
-        "ind":    info.get("industry","N/A"),
+        "ticker":           ticker,
+        "currentPrice":     round(cp, 2),
+        "fiftyTwoWeekHigh": fmt(h52),
+        "fiftyTwoWeekLow":  fmt(l52),
+        "nearAllTimeHigh":  near_ath,
+        "ATR_14d":          f"${atr:.2f}" if atr else "N/A",
+        "marketCap":        fmt(info.get("marketCap"), "money"),
+        "forwardPE":        fmt(info.get("forwardPE")),
+        "trailingPE":       fmt(info.get("trailingPE")),
+        "pegRatio":         fmt(info.get("pegRatio")),
+        "forwardEps":       fmt(info.get("forwardEps")),
+        "trailingEps":      fmt(info.get("trailingEps")),
+        "revenueGrowth":    fmt(info.get("revenueGrowth"),   "percent"),
+        "earningsGrowth":   fmt(info.get("earningsGrowth"),  "percent"),
+        "profitMargins":    fmt(info.get("profitMargins"),   "percent"),
+        "operatingMargins": fmt(info.get("operatingMargins"),"percent"),
+        "returnOnEquity":   fmt(info.get("returnOnEquity"),  "percent"),
+        "freeCashflow":     fmt(info.get("freeCashflow"),    "money"),
+        "debtToEquity":     fmt(info.get("debtToEquity")),
+        "beta":             fmt(info.get("beta")),
+        "RSI_14":           f"{rsi_v:.2f}" if isinstance(rsi_v,float) else "N/A",
+        "MACD_bias":        ("Bullish" if indicators and indicators["macd"]>indicators["signal"] else "Bearish") if indicators else "N/A",
+        "trend_200SMA":     ("Above" if cp>sma200 else "Below") if sma200 else "N/A",
+        "SMA_200":          f"${sma200:.2f}" if sma200 else "N/A",
+        "analystTarget":    fmt(info.get("targetMeanPrice")),
+        "blendedFairValue": f"${fv['fair_value']:.2f}" if fv else "N/A",
+        "fairValueUpside":  f"{fv['upside']:.1f}%" if fv else "N/A",
+        "DCF_value":        f"${fv['dcf_model']:.2f}" if fv and fv.get("dcf_model") else "N/A",
+        "bullCase":         f"${fv['bull_case']:.2f}" if fv else "N/A",
+        "bearCase":         f"${fv['bear_case']:.2f}" if fv else "N/A",
+        "peMultiple":       f"{fv['pe_multiple']:.0f}x" if fv else "N/A",
+        "terminalGrowth":   f"{fv['terminal_growth']:.1f}%" if fv else "N/A",
+        "analystAdjusted":  fv.get("analyst_adj", False) if fv else False,
+        "isMegaCap":        fv.get("is_megacap", False) if fv else False,
+        "sector":           info.get("sector","N/A"),
+        "industry":         info.get("industry","N/A"),
     }
 
-    # ── Source 2: news — top 5 only to save tokens ───────────────────────────
+    # ── Source 2: news (include breaking flag) ────────────────────────────────
     news_summary = []
-    for n in news[:5]:                          # hard cap: 5 headlines max
+    for n in news[:8]:
         entry = {
-            "h":  n.get("title","")[:120],      # truncate long headlines
-            "s":  n.get("sentiment","Neutral")[0],  # B/N/Be (1 char)
-            "sc": round(n.get("score",0.5),2),
+            "headline":  n.get("title",""),
+            "sentiment": n.get("sentiment","Neutral"),
+            "score":     round(n.get("score",0.5),2),
+            "reason":    n.get("reason",""),
+            "date":      n.get("published",""),
+            "breaking":  n.get("breaking",False),
         }
-        if n.get("breaking"):
-            entry["brk"] = True
         if n.get("hours_ago") is not None:
-            entry["age"] = f"{n['hours_ago']:.0f}h"
+            entry["hours_ago"] = f"{n['hours_ago']:.1f}h ago"
         news_summary.append(entry)
 
-    bull_n         = sum(1 for n in news if n.get("sentiment")=="Bullish")
-    bear_n         = sum(1 for n in news if n.get("sentiment")=="Bearish")
+    bull_n = sum(1 for n in news if n.get("sentiment")=="Bullish")
+    bear_n = sum(1 for n in news if n.get("sentiment")=="Bearish")
     breaking_count = sum(1 for n in news if n.get("breaking"))
     news_summary_obj = {
-        "top5":    news_summary,
-        "sent":    f"{bull_n}B/{bear_n}Be/{len(news)-bull_n-bear_n}N",
-        "brk":     breaking_count,
+        "headlines":       news_summary,
+        "summary":         f"{bull_n} Bullish / {bear_n} Bearish / {len(news)-bull_n-bear_n} Neutral",
+        "breaking_alerts": breaking_count,
     }
 
     # ── Source 3: earnings context ────────────────────────────────────────────
@@ -1388,14 +1433,12 @@ def run_ai_agent(
             "Add it to `.streamlit/secrets.toml` or your Streamlit Cloud Secrets panel "
             "to enable the AI agent."
         )
-    # Compact JSON serialisation — no indent, no extra whitespace.
-    # Saves ~25-35% prompt tokens vs indent=2 on large dicts.
     prompt = AGENT_PROMPT.format(
         date=datetime.now().strftime("%B %d, %Y"),
-        financial_data=json.dumps(financial_data, separators=(",", ":")),
-        news_data=json.dumps(news_summary_obj, separators=(",", ":")),
-        earnings_data=json.dumps(earnings_data, separators=(",", ":")),
-        prediction_data=json.dumps(prediction_data, separators=(",", ":")),
+        financial_data=json.dumps(financial_data, indent=2),
+        news_data=json.dumps(news_summary_obj, indent=2),
+        earnings_data=json.dumps(earnings_data, indent=2),
+        prediction_data=json.dumps(prediction_data, indent=2),
     )
     verdict = llm.invoke(prompt).content
     return verdict
@@ -1639,11 +1682,7 @@ def page_analysis(run_analysis: bool) -> None:
 
             # ── Candlestick chart — interactive with toggleable indicators ──────
             st.markdown("## 📊 Technical Analysis")
-            # RSI requires ≥200 bars for Wilder's warm-up to stabilise.
-            # Always fetch a 1-year daily series for indicator calculations,
-            # regardless of the display timeframe selected by the user.
-            _rsi_hist = get_stock_history(ticker, "1y", "1d")
-            indicators = calc_rsi_macd_bb(_rsi_hist if not _rsi_hist.empty else hist)
+            indicators = calc_rsi_macd_bb(hist)
 
             # Indicator toggle controls — stored in session_state so they survive reruns
             ind_defaults = st.session_state.get("chart_indicators", ["SMA 50","SMA 200"])
@@ -1757,14 +1796,11 @@ def page_analysis(run_analysis: bool) -> None:
 
             # ── Rows 3 & 4: RSI + MACD ────────────────────────────────────────
             if show_studies and indicators:
-                close     = hist["Close"]
-                delta     = close.diff()
-                _gain     = delta.where(delta > 0, 0.0)
-                _loss     = (-delta.where(delta < 0, 0.0))
-                _avg_gain = _gain.ewm(alpha=1/14, adjust=False).mean()
-                _avg_loss = _loss.ewm(alpha=1/14, adjust=False).mean()
-                _rs       = _avg_gain / _avg_loss.replace(0, float("nan"))
-                rsi_ser   = 100 - (100 / (1 + _rs))
+                close   = hist["Close"]
+                delta   = close.diff()
+                gain    = delta.where(delta > 0, 0).rolling(14).mean()
+                loss    = (-delta.where(delta < 0, 0)).rolling(14).mean()
+                rsi_ser = 100 - (100 / (1 + gain / loss))
 
                 # RSI
                 rsi_colors = []
