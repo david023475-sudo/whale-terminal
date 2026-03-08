@@ -823,79 +823,144 @@ def render_peer_group_info(peers: list[str], source: str = "auto") -> None:
 # =============================================================================
 POLYMARKET_API = "https://clob.polymarket.com"
 GAMMA_API      = "https://gamma-api.polymarket.com"
+_POLY_UA       = {"Accept": "application/json",
+                  "User-Agent": "WhaleTerminal/8.5 (research tool)"}
+
+
+def _parse_poly_market(m: dict) -> "dict | None":
+    """
+    UPGRADE: Parse a single market dict from either Gamma or CLOB response shape.
+    Returns None if no valid question can be extracted.
+    """
+    question = (m.get("question") or m.get("title") or "").strip()
+    if not question:
+        return None
+
+    # Price extraction — Gamma: outcomePrices list; CLOB: tokens list
+    yes_price = no_price = 0.5
+    op = m.get("outcomePrices")
+    if op:
+        try:
+            prices = json.loads(op) if isinstance(op, str) else list(op)
+            if len(prices) >= 2:
+                yes_price = max(0.0, min(1.0, float(prices[0])))
+                no_price  = max(0.0, min(1.0, float(prices[1])))
+        except Exception:
+            pass
+    else:
+        tokens = m.get("tokens") or []
+        if len(tokens) >= 2:
+            try:
+                yes_price = max(0.0, min(1.0, float(tokens[0].get("price", 0.5))))
+                no_price  = max(0.0, min(1.0, float(tokens[1].get("price", 0.5))))
+            except Exception:
+                pass
+
+    # Volume — different field names across endpoints
+    volume = 0.0
+    for vk in ("volume", "volumeNum", "volume24hr"):
+        try:
+            v = m.get(vk)
+            if v is not None:
+                volume = float(v)
+                if volume > 0:
+                    break
+        except Exception:
+            pass
+
+    slug = m.get("slug") or m.get("conditionId") or ""
+    return {
+        "question":  question,
+        "yes_price": yes_price,
+        "no_price":  no_price,
+        "volume":    volume,
+        "url":       f"https://polymarket.com/event/{slug}" if slug else "https://polymarket.com",
+        "end_date":  (m.get("endDate") or "")[:10],
+    }
+
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_polymarket_markets(query: str = "", limit: int = 8) -> list[dict]:
     """
-    Fetch active Polymarket prediction markets via the Gamma (markets) API.
-    Returns list of market dicts with: question, yes_price, no_price, volume, url.
-    Falls back to empty list on any error (Polymarket has CORS and rate limits).
-    """
-    markets: list[dict] = []
-    try:
-        # Gamma API: public, no auth needed, returns enriched market data
-        params: dict = {
-            "active":   "true",
-            "closed":   "false",
-            "order":    "volume",
-            "ascending":"false",
-            "limit":    str(limit * 3),  # fetch extra to allow filtering
-        }
-        if query:
-            params["tag_slug"] = ""  # reset; we'll filter client-side
-        resp = requests.get(f"{GAMMA_API}/markets", params=params, timeout=10)
-        resp.raise_for_status()
-        raw: list[dict] = resp.json()
-    except Exception:
-        raw = []
+    UPGRADE — 3-tier Polymarket fetch. Returns [] on total failure; never raises.
 
+    Tier 1: Gamma /markets  — primary, volume-sorted, over-fetch + client filter.
+    Tier 2: Gamma /events   — if Tier 1 returns nothing, scrape nested markets.
+    Tier 3: CLOB  /markets  — last resort REST endpoint.
+
+    Q5 answer: every requests.get is wrapped in an independent try/except.
+    If Tier 1 fails (network error, 429, 500, etc.) raw=[] and we fall through
+    to Tier 2, then Tier 3. If all three fail the function returns [] and the
+    UI in render_polymarket_tab() shows "No prediction market data available."
+    """
+    raw: list[dict] = []
+
+    # ── Tier 1: Gamma /markets (primary) ─────────────────────────────────────
+    try:
+        resp = requests.get(
+            f"{GAMMA_API}/markets",
+            params={"active": "true", "closed": "false",
+                    "order": "volume", "ascending": "false",
+                    "limit": str(min(limit * 4, 50))},
+            headers=_POLY_UA, timeout=12,
+        )
+        if resp.ok:
+            body = resp.json()
+            raw = body if isinstance(body, list) else body.get("markets", [])
+    except Exception as _e1:
+        print(f"[Polymarket Tier 1] {_e1}")
+        raw = []   # explicit: never propagate exception
+
+    # ── Tier 2: Gamma /events (fallback when Tier 1 empty) ───────────────────
     if not raw:
-        # Second attempt: CLOB REST endpoint (lower volume data)
         try:
             resp2 = requests.get(
-                f"{POLYMARKET_API}/markets",
-                params={"active":"true","closed":"false","limit":str(limit*3)},
-                timeout=10,
+                f"{GAMMA_API}/events",
+                params={"active": "true", "closed": "false",
+                        "limit": str(min(limit * 4, 40))},
+                headers=_POLY_UA, timeout=12,
             )
-            raw = resp2.json().get("data", []) if resp2.ok else []
-        except: raw = []
+            if resp2.ok:
+                events = resp2.json()
+                events = events if isinstance(events, list) else events.get("events", [])
+                for ev in events:
+                    for mk in (ev.get("markets") or []):
+                        mk.setdefault("question", ev.get("title", ""))
+                        raw.append(mk)
+        except Exception as _e2:
+            print(f"[Polymarket Tier 2] {_e2}")
+            raw = []   # explicit: never propagate exception
 
+    # ── Tier 3: CLOB /markets (last resort) ──────────────────────────────────
+    if not raw:
+        try:
+            resp3 = requests.get(
+                f"{POLYMARKET_API}/markets",
+                params={"active": "true", "closed": "false",
+                        "limit": str(min(limit * 3, 30))},
+                headers=_POLY_UA, timeout=12,
+            )
+            if resp3.ok:
+                body3 = resp3.json()
+                raw = body3.get("data", []) if isinstance(body3, dict) else []
+        except Exception as _e3:
+            print(f"[Polymarket Tier 3] {_e3}")
+            raw = []   # explicit: never propagate exception
+
+    # ── Parse + keyword filter ────────────────────────────────────────────────
+    q_tokens = [t.lower() for t in query.split() if t] if query else []
+    markets: list[dict] = []
     for m in raw:
-        question = (m.get("question") or m.get("title") or "").strip()
-        if not question: continue
-        if query:
-            q_lower = query.lower()
-            if not any(token in question.lower() for token in q_lower.split()):
-                continue
+        parsed = _parse_poly_market(m)
+        if parsed is None:
+            continue
+        if q_tokens and not any(tok in parsed["question"].lower() for tok in q_tokens):
+            continue
+        markets.append(parsed)
+        if len(markets) >= limit:
+            break
 
-        # Price normalisation: Gamma returns outcomePrices as list, CLOB as tokens
-        yes_price = no_price = 0.5
-        op = m.get("outcomePrices")
-        if op:
-            try:
-                prices = json.loads(op) if isinstance(op,str) else op
-                if len(prices) >= 2:
-                    yes_price = float(prices[0])
-                    no_price  = float(prices[1])
-            except: pass
-        else:
-            tokens = m.get("tokens", [])
-            if len(tokens) >= 2:
-                yes_price = float(tokens[0].get("price", 0.5))
-                no_price  = float(tokens[1].get("price", 0.5))
-
-        volume = float(m.get("volume","0") or m.get("volumeNum",0) or 0)
-        markets.append({
-            "question": question,
-            "yes_price": yes_price,
-            "no_price":  no_price,
-            "volume":    volume,
-            "url":       f"https://polymarket.com/event/{m.get('slug','')}" if m.get("slug") else "https://polymarket.com",
-            "end_date":  (m.get("endDate","") or "")[:10],
-        })
-        if len(markets) >= limit: break
-
-    return markets
+    return markets  # [] if all tiers failed — never raises
 
 
 def render_polymarket_tab(ticker: str, sector: str = "") -> None:
@@ -942,10 +1007,11 @@ def render_polymarket_tab(ticker: str, sector: str = "") -> None:
     all_markets = ticker_markets + [m for m in macro_markets if m not in ticker_markets]
 
     if not all_markets:
-        st.info(
-            "No live markets found for this query. Polymarket may be rate-limiting or "
-            "no active markets exist for this ticker. "
-            f"[Browse Polymarket manually →](https://polymarket.com/search?q={ticker})"
+        # UPGRADE (Q5): exact string requested — shown whenever [] is returned
+        st.info("No prediction market data available.")
+        st.caption(
+            f"Polymarket returned no active markets for this query. "
+            f"[Search Polymarket manually →](https://polymarket.com/search?q={ticker})"
         )
         return
 
