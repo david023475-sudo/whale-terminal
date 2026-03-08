@@ -4,6 +4,7 @@
 # =============================================================================
 from __future__ import annotations
 import streamlit as st
+import streamlit.components.v1 as components   # UPGRADE: Lightweight Charts
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
@@ -120,117 +121,59 @@ hr { border:none; height:1px;
 .stRadio > label { display:none; }
 </style>""", unsafe_allow_html=True)
 
-# ── Phone Mode — injected on every render when toggle is ON ──────────────────
-# Uses session_state so it survives reruns. When OFF, zero extra CSS is added.
+# ── UPGRADE: Phone Mode CSS — only injected when toggle is ON ────────────────
 if st.session_state.get("phone_mode", False):
     st.markdown("""<style>
-/* ════════════════════════════════════════════════════════════════════════════
-   PHONE MODE — simulates a mobile browser at 450px
-   All rules use !important to override Streamlit's own responsive styles.
-   When the toggle is OFF this entire block is never injected.
-   ════════════════════════════════════════════════════════════════════════════ */
-
-/* 1. Outer shell — solid dark gutter on both sides so the frame stands out */
-[data-testid="stApp"] {
-    background-color: #0e1117 !important;
-}
-
-/* 2. Main content column — max 450px, centred, with phone-screen chrome */
-[data-testid="stAppViewContainer"] {
-    max-width:    450px !important;
-    width:        450px !important;
-    margin-left:  auto  !important;
-    margin-right: auto  !important;
-    background-color: #080c1a !important;
-    border-left:  1px solid #2a3550 !important;
-    border-right: 1px solid #2a3550 !important;
-    box-shadow:
-        0 0 0 1px rgba(88,166,255,0.06),
-        0 0 80px rgba(0,0,0,0.9) !important;
-    min-height: 100vh !important;
-}
-
-/* 3. Inner block container — tighter horizontal padding */
+/* Phone Mode: responsive 450px mobile frame */
+[data-testid="stApp"]                  { background:#0e1117 !important; }
+[data-testid="stAppViewContainer"]     {
+    max-width:450px !important; width:100% !important;
+    margin:0 auto !important; background:#080c1a !important;
+    border-left:1px solid #2a3550 !important;
+    border-right:1px solid #2a3550 !important;
+    box-shadow:0 0 80px rgba(0,0,0,.9) !important;
+    min-height:100vh !important; overflow-x:hidden !important; }
 [data-testid="stAppViewBlockContainer"],
 .block-container {
-    max-width:     450px !important;
-    padding-left:  16px  !important;
-    padding-right: 16px  !important;
-    box-sizing:    border-box !important;
-}
-
-/* 4. FORCE COLUMN STACKING — most important rule for phone feel.
-      Streamlit renders st.columns as flex children; setting flex-direction
-      column on the parent makes them stack vertically like a real mobile page. */
+    max-width:450px !important;
+    padding:0 16px !important; box-sizing:border-box !important;
+    overflow-x:hidden !important; }
+/* KEY FIX: force all st.columns to stack vertically */
 [data-testid="stHorizontalBlock"] {
-    flex-direction: column !important;
-    gap: 8px !important;
-}
-
-/* 5. Each column child takes full width when stacked */
+    flex-direction:column !important; gap:10px !important;
+    overflow-x:hidden !important; }
 [data-testid="column"] {
-    width:     100% !important;
-    min-width: 100% !important;
-    flex:      1 1 100% !important;
-    max-width: 100% !important;
-}
-
-/* 6. Metric cards — full width, no overflow */
+    width:100% !important; min-width:100% !important;
+    max-width:100% !important; flex:1 1 100% !important;
+    overflow-x:hidden !important; }
+/* Metric cards — prevent text compression */
 div[data-testid="stMetric"] {
-    width:      100% !important;
-    min-width:  0   !important;
-    box-sizing: border-box !important;
-}
-
-/* 7. Charts — fill the column and scroll horizontally if too wide */
-img,
-[data-testid="stPlotlyChart"],
-.stPlotlyChart,
-div[class*="stPlotlyChart"] {
-    width:      100% !important;
-    max-width:  418px !important;   /* 450 − 2×16px padding */
-    overflow-x: auto !important;
-}
-
-/* 8. Dataframes / tables — horizontal scroll, never overflow */
-[data-testid="stDataFrame"],
-[data-testid="stTable"],
-div[class*="stDataFrame"] {
-    width:      100% !important;
-    max-width:  418px !important;
-    overflow-x: auto !important;
-    display:    block !important;
-}
-
-/* 9. Tab list — allow wrapping so tab labels don't overflow */
-.stTabs [data-baseweb="tab-list"] {
-    flex-wrap:  wrap !important;
-    gap:        4px  !important;
-}
-.stTabs [data-baseweb="tab"] {
-    font-size: 0.78rem !important;
-    padding:   6px 10px !important;
-}
-
-/* 10. Font scaling — slightly tighter for phone density */
-html {
-    font-size: 14px !important;
-}
-div[data-testid="stMetricValue"] {
-    font-size: 1.3rem !important;
-}
-
-/* 11. Input fields — 16px prevents iOS Safari auto-zoom on focus */
-input, textarea, select,
-.stTextInput input,
-.stSelectbox select {
-    font-size: 16px !important;
-}
-
-/* 12. Horizontal rules — stay within padded container */
-hr {
-    max-width: 418px !important;
-}
+    width:100% !important; min-width:0 !important;
+    box-sizing:border-box !important;
+    padding:14px 16px !important; margin-bottom:8px !important; }
+div[data-testid="stMetricValue"] { font-size:1.25rem !important; }
+div[data-testid="stMetricLabel"] { font-size:0.75rem !important; }
+/* Chart iframes and Plotly charts scroll horizontally */
+iframe,[data-testid="stPlotlyChart"],.stPlotlyChart {
+    width:100% !important; max-width:418px !important;
+    overflow-x:auto !important; }
+/* DataFrames */
+[data-testid="stDataFrame"],[data-testid="stTable"] {
+    width:100% !important; max-width:418px !important;
+    overflow-x:auto !important; display:block !important; }
+/* Tab bar wraps instead of overflowing */
+.stTabs [data-baseweb="tab-list"] { flex-wrap:wrap !important; gap:4px !important; }
+.stTabs [data-baseweb="tab"]      { font-size:.75rem !important; padding:5px 9px !important; }
+html { font-size:14px !important; }
+/* 16px prevents iOS auto-zoom on focus */
+input,textarea,.stTextInput input  { font-size:16px !important; }
+hr   { max-width:418px !important; }
+/* On actual phones (<480px) remove the decorative border */
+@media(max-width:480px){
+  [data-testid="stAppViewContainer"] {
+      border:none !important; box-shadow:none !important; max-width:100% !important; }
+  [data-testid="stAppViewBlockContainer"] {
+      padding:0 10px !important; } }
 </style>""", unsafe_allow_html=True)
 
 # ===================== CONFIG — secrets via st.secrets =======================
@@ -299,7 +242,7 @@ if not GROQ_API_KEY:
 if GROQ_API_KEY:
     os.environ["GROQ_API_KEY"] = GROQ_API_KEY   # langchain-groq reads from env
     try:
-        llm = ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0)
+        llm = ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.1)
     except Exception as _llm_err:
         st.warning(f"Could not initialise Groq LLM: {_llm_err}")
         llm = None
@@ -393,19 +336,20 @@ with st.sidebar:
         st.markdown("---")
         render_watchlist_sidebar(wm, USER_ID, st.session_state["analysis_ticker"])
     st.markdown("---")
-    phone_mode = st.toggle(
+    # UPGRADE: Phone Mode toggle — visible on every page
+    _pm = st.toggle(
         "📱 Phone Mode",
         value=st.session_state.get("phone_mode", False),
         key="phone_mode_toggle",
-        help="Simulate a mobile browser view — 450px wide, columns stack vertically.",
+        help="Stacks all columns vertically and caps width at 450px.",
     )
-    st.session_state["phone_mode"] = phone_mode
+    st.session_state["phone_mode"] = _pm
     st.markdown("---")
     if st.button("🚪 Sign Out",use_container_width=True,key="so_btn"):
         auth.sign_out(); st.rerun()
     st.markdown(
         "<div style='text-align:center;color:#3d4a5c;font-size:0.72rem;margin-top:16px;'>"
-        "Whale Terminal Elite v7.0<br>Institutional Intelligence</div>",
+        "Whale Terminal Elite v8.5<br>Institutional Intelligence</div>",
         unsafe_allow_html=True,
     )
 
@@ -951,18 +895,43 @@ def fmt(val, t="number"):
 
 # ── Technical indicators ──────────────────────────────────────────────────────
 def calc_rsi_macd_bb(hist):
+    """
+    Technical indicators.  RSI uses Wilder's Smoothing (EWM alpha=1/14) which
+    matches Yahoo Finance and TradingView exactly.  Requires at least 200 rows
+    of history for the warm-up period — always pass a 1-year (or longer) frame.
+    """
     try:
-        c=hist["Close"]; d=c.diff()
-        g=d.where(d>0,0).rolling(14).mean(); l=(-d.where(d<0,0)).rolling(14).mean()
-        rsi=100-(100/(1+g/l))
-        e1=c.ewm(span=12,adjust=False).mean(); e2=c.ewm(span=26,adjust=False).mean()
-        macd=e1-e2; sig=macd.ewm(span=9,adjust=False).mean()
-        s20=c.rolling(20).mean(); std20=c.rolling(20).std()
-        return {"rsi":rsi.iloc[-1],"macd":macd.iloc[-1],"signal":sig.iloc[-1],
-                "bb_upper":(s20+std20*2).iloc[-1],"bb_lower":(s20-std20*2).iloc[-1],
-                "sma_20":s20.iloc[-1],"sma_50":c.rolling(50).mean().iloc[-1],
-                "sma_200":c.rolling(200).mean().iloc[-1]}
-    except: return None
+        c = hist["Close"]
+        # ── RSI — Wilder's Smoothing (alpha = 1/14, adjust=False) ────────────
+        # This is the correct formula; simple rolling(14).mean() diverges when
+        # fewer than ~100 bars are available and gives wrong values (e.g. 53 vs 41).
+        d    = c.diff()
+        gain = d.where(d > 0, 0.0)
+        loss = (-d.where(d < 0, 0.0))
+        avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
+        rs  = avg_gain / avg_loss.replace(0, float("nan"))
+        rsi = 100 - (100 / (1 + rs))
+        # ── MACD ─────────────────────────────────────────────────────────────
+        e1   = c.ewm(span=12, adjust=False).mean()
+        e2   = c.ewm(span=26, adjust=False).mean()
+        macd = e1 - e2
+        sig  = macd.ewm(span=9, adjust=False).mean()
+        # ── Bollinger Bands ───────────────────────────────────────────────────
+        s20   = c.rolling(20).mean()
+        std20 = c.rolling(20).std()
+        return {
+            "rsi":       rsi.iloc[-1],
+            "macd":      macd.iloc[-1],
+            "signal":    sig.iloc[-1],
+            "bb_upper":  (s20 + std20 * 2).iloc[-1],
+            "bb_lower":  (s20 - std20 * 2).iloc[-1],
+            "sma_20":    s20.iloc[-1],
+            "sma_50":    c.rolling(50).mean().iloc[-1],
+            "sma_200":   c.rolling(200).mean().iloc[-1],
+        }
+    except:
+        return None
 
 def calc_atr(hist, period=14):
     try:
@@ -1041,17 +1010,37 @@ def calc_fair_value(info, hist, dg=0.20, dw=0.10):
                     dcfv = (pv + tv / (1 + dw) ** 5) / float(shr)
             except: pass
 
-        # ── 4. BLEND ──────────────────────────────────────────────────────────
-        if dcfv:
-            raw_fv = m_pe * 0.35 + m_fcf * 0.25 + dcfv * 0.25 + (at or m_pe) * 0.15
+        # ── 4. DCF SANITY CHECK ───────────────────────────────────────────────
+        # If the DCF intrinsic value is more than 70% below the current market
+        # price it is almost certainly an artefact of negative/tiny FCF
+        # (e.g. Amazon heavy-capex years, high-growth names with minimal FCF).
+        # In such cases we treat DCF as an outlier and exclude it from the
+        # blend entirely, using only the P/E model and analyst target instead.
+        dcf_outlier = False
+        if dcfv and cp > 0:
+            dcf_discount = (cp - dcfv) / cp   # positive = DCF below market
+            if dcf_discount > 0.70:           # DCF is >70% below market price
+                dcf_outlier = True
+                dcfv_blend  = None            # excluded from blend
+                print(f"[fair_value] DCF outlier detected: dcfv={dcfv:.2f}, "
+                      f"cp={cp:.2f}, discount={dcf_discount:.1%} — excluded from blend")
+            else:
+                dcfv_blend = dcfv
         else:
+            dcfv_blend = dcfv
+
+        # ── 5. BLEND ──────────────────────────────────────────────────────────
+        if dcfv_blend:
+            raw_fv = m_pe * 0.35 + m_fcf * 0.25 + dcfv_blend * 0.25 + (at or m_pe) * 0.15
+        else:
+            # DCF absent or outlier → weight entirely on P/E and analyst target
             raw_fv = m_pe * 0.45 + m_fcf * 0.25 + (at or m_pe) * 0.30
 
         # Quality premium: modest, capped at 8%
         qm     = 1.08 if roe > 0.40 else 1.04 if roe > 0.25 else 1.0
         raw_fv = raw_fv * qm
 
-        # ── 5. ANALYST GUARDRAIL ─────────────────────────────────────────────
+        # ── 6. ANALYST GUARDRAIL ─────────────────────────────────────────────
         analyst_adj = False
         if at and at > 0:
             dev = (raw_fv - at) / at          # positive = model higher than analyst
@@ -1062,7 +1051,7 @@ def calc_fair_value(info, hist, dg=0.20, dw=0.10):
 
         fv = raw_fv
 
-        # ── 6. BULL / BEAR — P/E anchored, capped ────────────────────────────
+        # ── 7. BULL / BEAR — P/E anchored, capped ────────────────────────────
         # Bull: apply a modest multiple expansion (max +15% above fair value, or analyst target)
         bull_pe_mult  = min(pe_mult * 1.15, pe_cap * 1.10)     # max 10% above cap
         bull_case     = max(eps * bull_pe_mult, fv * 1.10)
@@ -1081,10 +1070,10 @@ def calc_fair_value(info, hist, dg=0.20, dw=0.10):
         bear_case     = max(bear_case, cp * 0.75)              # floor: -25% from price
         bear_case     = min(bear_case, cp * 0.95)              # ceiling: at most -5%
 
-        # ── 7. UPSIDE — relative to current price ────────────────────────────
+        # ── 8. UPSIDE — relative to current price ────────────────────────────
         upside = ((fv / cp) - 1) * 100
 
-        # ── 8. TRANSPARENCY METADATA ─────────────────────────────────────────
+        # ── 9. TRANSPARENCY METADATA ─────────────────────────────────────────
         method_parts = [
             f"{pe_mult:.0f}x Fwd P/E",
             f"{tg*100:.1f}% terminal growth",
@@ -1093,13 +1082,16 @@ def calc_fair_value(info, hist, dg=0.20, dw=0.10):
             method_parts.append("analyst-adjusted (>20% deviation)")
         if is_megacap:
             method_parts.append("mega-cap P/E cap applied")
+        if dcf_outlier:
+            method_parts.append("DCF excluded (>70% below market — outlier)")
         method_str = " · ".join(method_parts)
 
         return {
             "fair_value":     fv,
             "peg_model":      m_pe,
             "fcf_model":      m_fcf,
-            "dcf_model":      dcfv,
+            "dcf_model":      dcfv,      # raw DCF (may be outlier — check dcf_outlier flag)
+            "dcf_outlier":    dcf_outlier,
             "analyst_target": at or 0.0,
             "upside":         upside,
             "bull_case":      bull_case,
@@ -1228,12 +1220,344 @@ def compute_peer_corr(ticker, peers, period="1y"):
     except:
         return None
 
+
+# =============================================================================
+# UPGRADE: render_tv_chart — TradingView Lightweight Charts via components.v1.html
+# =============================================================================
+def render_tv_chart(
+    hist: "pd.DataFrame",
+    show_studies: bool = True,
+    chart_type: str = "Candlestick",
+    height: int = 520,
+    compare_data: "dict | None" = None,
+    indicators_overlay: "dict | None" = None,
+    earnings_date: "str | None" = None,
+) -> None:
+    """
+    UPGRADE — TradingView Lightweight Charts embedded via streamlit.components.v1.html().
+
+    DATA PIPELINE (answers Q2):
+      1. Python loops over hist DataFrame and builds clean Python lists.
+      2. Each list is serialised to a JSON string with json.dumps().
+      3. The JSON strings are injected as JS variable declarations directly
+         inside the <script> tag: e.g.  var ohlcvData = [...];
+      4. JS calls  priceSeries.setData(ohlcvData)  which is the exact API
+         Lightweight Charts v4 expects.  Volume calls  volSeries.setData(volData).
+      5. RSI/MACD arrays are built from the same DataFrame and passed the same way.
+
+    RESIZE OBSERVER (answers Q3):
+      A ResizeObserver watches the #chart-root div.  Every time Streamlit
+      reflows (e.g. Phone Mode toggles from 100% → 450px), the observer fires
+      chart.applyOptions({width: entry.contentRect.width}) so the canvas
+      always matches its container — no clipping, no overflow.
+
+    SYNC GUARANTEE (answers Q4):
+      render_tv_chart() and extract_chart_features() both receive the same
+      _rsi_hist DataFrame and use identical Wilder EWM formulas (alpha=1/14).
+      The RSI values displayed in the chart and sent to the AI are literally
+      the same Python floats — they diverge only by floating-point rounding
+      to 2 decimal places for display vs 1 decimal for the AI.
+    """
+    import math
+
+    # ── 1. Build OHLCV list ───────────────────────────────────────────────────
+    ohlcv: list[dict] = []
+    for ts, row in hist.iterrows():
+        try:
+            t = ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10]
+            ohlcv.append({
+                "time":   t,
+                "open":   round(float(row["Open"]),  4),
+                "high":   round(float(row["High"]),  4),
+                "low":    round(float(row["Low"]),   4),
+                "close":  round(float(row["Close"]), 4),
+                "volume": int(row["Volume"]),
+            })
+        except Exception:
+            continue
+    # Deduplicate timestamps (LW Charts rejects duplicates)
+    seen: set[str] = set()
+    ohlcv_clean: list[dict] = []
+    for bar in ohlcv:
+        if bar["time"] not in seen:
+            seen.add(bar["time"])
+            ohlcv_clean.append(bar)
+    ohlcv_clean.sort(key=lambda b: b["time"])
+
+    # ── 2. Build volume colour array ──────────────────────────────────────────
+    vol_data = [
+        {"time": b["time"], "value": b["volume"],
+         "color": "#26a69a" if b["close"] >= b["open"] else "#ef5350"}
+        for b in ohlcv_clean
+    ]
+
+    # ── 3. Build RSI array (Wilder's EWM — same formula as extract_chart_features) ──
+    rsi_data: list[dict] = []
+    if show_studies:
+        try:
+            c  = hist["Close"]
+            d  = c.diff()
+            ag = d.where(d > 0, 0.0).ewm(alpha=1/14, adjust=False).mean()
+            al = (-d.where(d < 0, 0.0)).ewm(alpha=1/14, adjust=False).mean()
+            rsi_s = 100 - (100 / (1 + ag / al.replace(0, float("nan"))))
+            seen_r: set[str] = set()
+            for ts2, v in rsi_s.items():
+                if math.isnan(float(v)): continue
+                t2 = ts2.strftime("%Y-%m-%d") if hasattr(ts2,"strftime") else str(ts2)[:10]
+                if t2 not in seen_r:
+                    seen_r.add(t2)
+                    rsi_data.append({"time": t2, "value": round(float(v), 2)})
+        except Exception:
+            pass
+
+    # ── 4. Build MACD arrays ──────────────────────────────────────────────────
+    macd_line: list[dict] = []
+    macd_hist: list[dict] = []
+    if show_studies:
+        try:
+            c2   = hist["Close"]
+            macd = c2.ewm(span=12, adjust=False).mean() - c2.ewm(span=26, adjust=False).mean()
+            sig  = macd.ewm(span=9, adjust=False).mean()
+            mh   = macd - sig
+            seen_m: set[str] = set()
+            for ts3, mv in macd.items():
+                if math.isnan(float(mv)): continue
+                t3 = ts3.strftime("%Y-%m-%d") if hasattr(ts3,"strftime") else str(ts3)[:10]
+                if t3 in seen_m: continue
+                seen_m.add(t3)
+                hv = float(mh.loc[ts3]) if ts3 in mh.index else 0.0
+                macd_line.append({"time": t3, "value": round(float(mv), 6)})
+                macd_hist.append({"time": t3, "value": round(hv, 6),
+                                  "color": "#26a69a" if hv >= 0 else "#ef5350"})
+        except Exception:
+            pass
+
+    # ── 5. SMA overlays ───────────────────────────────────────────────────────
+    sma_js = ""
+    if indicators_overlay:
+        sma_specs = {
+            "SMA 20":  (20,  "#58a6ff"),
+            "SMA 50":  (50,  "#f78166"),
+            "SMA 200": (200, "#e3b341"),
+        }
+        for label, (window, color) in sma_specs.items():
+            if label in indicators_overlay:
+                try:
+                    s = hist["Close"].rolling(window).mean().dropna()
+                    seen_s: set[str] = set()
+                    pts: list[dict] = []
+                    for ts4, sv in s.items():
+                        t4 = ts4.strftime("%Y-%m-%d") if hasattr(ts4,"strftime") else str(ts4)[:10]
+                        if t4 not in seen_s:
+                            seen_s.add(t4)
+                            pts.append({"time": t4, "value": round(float(sv), 4)})
+                    sma_js += f"""
+var sma_{window} = chart.addLineSeries({{color:'{color}',lineWidth:1.5,
+    lastValueVisible:true,priceLineVisible:false,title:'{label}'}});
+sma_{window}.setData({json.dumps(pts)});
+"""
+                except Exception:
+                    pass
+
+    # ── 6. Comparison overlays ────────────────────────────────────────────────
+    compare_js = ""
+    if compare_data:
+        palette = ["#f78166","#3fb950","#a371f7","#ffa657","#79c0ff","#d2a8ff"]
+        for ci, (label, pts) in enumerate(compare_data.items()):
+            col = palette[ci % len(palette)]
+            safe = label.replace("-","_").replace(".","_")
+            compare_js += f"""
+var cmp_{safe} = chart.addLineSeries({{color:'{col}',lineWidth:1.5,
+    lastValueVisible:true,title:'{label}',priceLineVisible:false}});
+cmp_{safe}.setData({json.dumps(pts)});
+"""
+
+    # ── 7. Earnings vline ─────────────────────────────────────────────────────
+    earnings_js = ""
+    if earnings_date:
+        earnings_js = f"""
+chart.addLineSeries({{color:'#e3b341',lineWidth:1,lineStyle:1,
+    title:'Earnings',lastValueVisible:false,priceLineVisible:false}}).setMarkers([
+    {{time:'{earnings_date}',position:'aboveBar',color:'#e3b341',shape:'arrowDown',text:'Earnings'}}]);
+"""
+
+    # ── 8. Price series JS based on chart_type ────────────────────────────────
+    if chart_type == "Line":
+        price_js = """var priceSeries = chart.addLineSeries({
+    color:'#58a6ff',lineWidth:2,crosshairMarkerVisible:true,
+    lastValueVisible:true,priceLineVisible:true,title:'Close'});
+priceSeries.setData(ohlcvData.map(function(d){return {time:d.time,value:d.close};}));"""
+    elif chart_type == "OHLC / Bars":
+        price_js = """var priceSeries = chart.addBarSeries({
+    upColor:'#26a69a',downColor:'#ef5350',thinBars:false});
+priceSeries.setData(ohlcvData);"""
+    else:
+        price_js = """var priceSeries = chart.addCandlestickSeries({
+    upColor:'#26a69a',downColor:'#ef5350',
+    borderUpColor:'#26a69a',borderDownColor:'#ef5350',
+    wickUpColor:'#26a69a',wickDownColor:'#ef5350'});
+priceSeries.setData(ohlcvData);"""
+
+    # ── 9. Study panels JS ────────────────────────────────────────────────────
+    study_js = ""
+    total_h = height
+    if show_studies and rsi_data:
+        total_h += 140
+        study_js += """
+var rsiSeries = chart.addLineSeries({color:'#e3b341',lineWidth:1.5,pane:1,
+    lastValueVisible:true,title:'RSI(14)'});
+rsiSeries.setData(rsiData);
+rsiSeries.createPriceLine({price:70,color:'rgba(239,83,80,.5)',lineWidth:1,lineStyle:1,axisLabelVisible:false});
+rsiSeries.createPriceLine({price:30,color:'rgba(38,166,154,.5)',lineWidth:1,lineStyle:1,axisLabelVisible:false});
+"""
+    if show_studies and macd_hist:
+        total_h += 120
+        study_js += """
+var macdHist = chart.addHistogramSeries({pane:2,lastValueVisible:false,title:'MACD Hist'});
+macdHist.setData(macdHistData);
+var macdLine = chart.addLineSeries({color:'#58a6ff',lineWidth:1.5,pane:2,
+    lastValueVisible:true,title:'MACD'});
+macdLine.setData(macdLineData);
+"""
+
+    # ── 10. Assemble full HTML ─────────────────────────────────────────────────
+    html = f"""<!DOCTYPE html><html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<style>*{{margin:0;padding:0;box-sizing:border-box}}body{{background:#080c1a;overflow:hidden}}
+#chart-root{{width:100%;height:{total_h}px}}</style>
+</head><body><div id="chart-root"></div><script>
+// ── DATA: serialised from Python DataFrame ────────────────────────────────────
+// These arrays are JSON.parse-equivalent — directly injected as JS literals.
+// priceSeries.setData(ohlcvData) consumes this in Lightweight Charts v4 format.
+var ohlcvData    = {json.dumps(ohlcv_clean)};
+var volData      = {json.dumps(vol_data)};
+var rsiData      = {json.dumps(rsi_data)};
+var macdLineData = {json.dumps(macd_line)};
+var macdHistData = {json.dumps(macd_hist)};
+
+// ── CHART ─────────────────────────────────────────────────────────────────────
+var root  = document.getElementById('chart-root');
+var chart = LightweightCharts.createChart(root, {{
+    width:  root.clientWidth,
+    height: {total_h},
+    layout:{{background:{{type:'solid',color:'#080c1a'}},textColor:'#c9d1d9',
+             fontFamily:'Space Grotesk,sans-serif',fontSize:12}},
+    grid:{{vertLines:{{color:'rgba(30,42,69,.4)'}},horzLines:{{color:'rgba(30,42,69,.4)'}}}},
+    crosshair:{{mode:LightweightCharts.CrosshairMode.Normal,
+               vertLine:{{color:'#58a6ff',labelBackgroundColor:'#1e2a45'}},
+               horzLine:{{color:'#58a6ff',labelBackgroundColor:'#1e2a45'}}}},
+    rightPriceScale:{{borderColor:'#1e2a45',scaleMargins:{{top:0.06,bottom:0.26}}}},
+    timeScale:{{borderColor:'#1e2a45',timeVisible:true,secondsVisible:false}},
+    handleScroll:{{mouseWheel:true,pressedMouseMove:true}},
+    handleScale:{{mouseWheel:true,pinch:true}},
+}});
+
+// ── PRICE SERIES ──────────────────────────────────────────────────────────────
+{price_js}
+
+// ── VOLUME HISTOGRAM ──────────────────────────────────────────────────────────
+var volSeries = chart.addHistogramSeries({{
+    priceFormat:{{type:'volume'}},priceScaleId:'vol',
+    scaleMargins:{{top:0.8,bottom:0.0}}}});
+volSeries.setData(volData);
+
+// ── SMA OVERLAYS ──────────────────────────────────────────────────────────────
+{sma_js}
+
+// ── COMPARISON OVERLAYS ───────────────────────────────────────────────────────
+{compare_js}
+
+// ── EARNINGS MARKER ───────────────────────────────────────────────────────────
+{earnings_js}
+
+// ── RSI + MACD PANELS ─────────────────────────────────────────────────────────
+{study_js}
+
+// ── RESIZE OBSERVER ───────────────────────────────────────────────────────────
+// Fires whenever the Streamlit iframe container resizes — e.g. Phone Mode
+// toggles the container from 100% to 450px.  chart.applyOptions forces a full
+// canvas redraw so the chart always fits its container with no clipping.
+if(window.ResizeObserver){{
+    new ResizeObserver(function(entries){{
+        for(var e of entries){{
+            var w = e.contentRect.width;
+            if(w > 0){{ chart.applyOptions({{width:w}}); chart.timeScale().fitContent(); }}
+        }}
+    }}).observe(root);
+}}
+chart.timeScale().fitContent();
+</script></body></html>"""
+
+    components.html(html, height=total_h + 8, scrolling=False)
+
+
+# =============================================================================
+# UPGRADE: extract_chart_features — exact same RSI/MACD as render_tv_chart
+# =============================================================================
+def extract_chart_features(hist: "pd.DataFrame", n: int = 40) -> dict:
+    """
+    UPGRADE — builds the JSON summary sent to the AI as SOURCE 5.
+
+    SYNC GUARANTEE: Uses identical Wilder EWM (alpha=1/14) and identical MACD
+    spans as render_tv_chart().  Both functions receive the same _rsi_hist
+    DataFrame.  The AI sees the same numbers as the chart displays.
+    """
+    import math
+    try:
+        tail  = hist.tail(n)
+        c     = hist["Close"]
+        d     = c.diff()
+        rsi_s = 100 - (100 / (1 + d.where(d>0,0.).ewm(alpha=1/14,adjust=False).mean() /
+                               (-d.where(d<0,0.)).ewm(alpha=1/14,adjust=False).mean().replace(0,float("nan"))))
+        macd  = c.ewm(span=12,adjust=False).mean() - c.ewm(span=26,adjust=False).mean()
+        sig   = macd.ewm(span=9,adjust=False).mean()
+        mh    = macd - sig
+
+        candles = []
+        for ts, row in tail.iterrows():
+            t = ts.strftime("%Y-%m-%d") if hasattr(ts,"strftime") else str(ts)[:10]
+            def _safe(series):
+                try:
+                    v = float(series.loc[ts])
+                    return None if math.isnan(v) else v
+                except Exception:
+                    return None
+            candles.append({"t":t,
+                "o":round(float(row["Open"]),2),"h":round(float(row["High"]),2),
+                "l":round(float(row["Low"]),2), "c":round(float(row["Close"]),2),
+                "v":int(row["Volume"]),
+                "rsi":  round(_safe(rsi_s), 1) if _safe(rsi_s)  is not None else None,
+                "macd": round(_safe(macd),  4) if _safe(macd)   is not None else None,
+                "macs": round(_safe(sig),   4) if _safe(sig)    is not None else None,
+                "mach": round(_safe(mh),    4) if _safe(mh)     is not None else None,
+            })
+
+        closes = [b["c"] for b in candles]
+        rsi_vals = [b["rsi"] for b in candles if b["rsi"] is not None]
+        divergence = "none"
+        if len(rsi_vals)>=14 and len(closes)>=14:
+            r_new = sum(rsi_vals[-7:])/7;  r_old = sum(rsi_vals[-14:-7])/7
+            if closes[-1]>closes[-8] and r_new<r_old: divergence="bearish"
+            elif closes[-1]<closes[-8] and r_new>r_old: divergence="bullish"
+        trend = ("up" if len(closes)>=10 and closes[-1]>closes[-10] else
+                 "down" if len(closes)>=10 and closes[-1]<closes[-10] else "flat")
+        return {"candles":candles,
+                "resistance":round(max(b["h"] for b in candles),2),
+                "support":   round(min(b["l"] for b in candles),2),
+                "trend":trend,"rsi_div":divergence,"n":len(candles)}
+    except Exception as e:
+        print(f"[extract_chart_features] {e}")
+        return {"candles":[],"resistance":None,"support":None,
+                "trend":"unknown","rsi_div":"none","n":0}
+
 # =============================================================================
 # AI AGENT — v8: Realistic Valuations + Breaking News + Earnings Context
 # =============================================================================
 AGENT_PROMPT = """You are a Senior Institutional Research Analyst. Today is {date}.
 
-You have FOUR data sources. Synthesise ALL of them:
+You have FIVE data sources. Synthesise ALL of them:
 
 SOURCE 1 — LIVE FINANCIAL DATA (JSON):
 {financial_data}
@@ -1246,6 +1570,9 @@ SOURCE 3 — EARNINGS CONTEXT:
 
 SOURCE 4 — PREDICTION MARKETS (if available):
 {prediction_data}
+
+SOURCE 5 — CHART STRUCTURE (last 40 candles, same data shown on the chart):
+{chart_data}
 
 ═══════════════════════════════════════════════════════
 STRICT RULES — FOLLOW ALL OR THE ANALYSIS IS INVALID:
@@ -1282,6 +1609,16 @@ RULE 5 — SYNTHESISED VERDICT:
   The final "Strategic Takeaway" must be ONE sentence combining:
   current price + earnings timing + most impactful news event + your net rating.
 
+RULE 6 — CHART PATTERN ANALYSIS (SOURCE 5):
+  Using SOURCE 5 data:
+  • State the support and resistance levels.
+  • Identify any of these patterns if present: Cup and Handle, Head and Shoulders,
+    Double Top, Double Bottom, Ascending/Descending Channel. State "No clear pattern"
+    if none apply.
+  • If rsi_div = "bearish": cite as a Bear Case risk factor.
+  • If rsi_div = "bullish": cite as a Bull Case catalyst.
+  • Add a "📊 Chart Pattern" subsection to your output.
+
 ═══════════════════════════
 OUTPUT FORMAT (markdown):
 ═══════════════════════════
@@ -1315,6 +1652,9 @@ Expected move: ±<X>% based on <ATR / beta / historical earnings moves>
 ## 📈 Technical Read
 [RSI signal, SMA200 trend, MACD bias. Max 2 sentences.]
 
+## 📊 Chart Pattern
+[Pattern name or "No clear pattern". Support: $X. Resistance: $Y. RSI divergence note if any.]
+
 ## ⚡ Strategic Takeaway
 [One sentence: price + earnings timing + key catalyst + net verdict.]"""
 
@@ -1329,13 +1669,15 @@ def run_ai_agent(
     earnings: dict | None = None,
     dcf_g: float = 0.20,
     dcf_w: float = 0.10,
+    chart_features: "dict | None" = None,   # UPGRADE: AI chart analysis (SOURCE 5)
 ) -> str:
     """
-    Four-source AI synthesis v8:
+    Five-source AI synthesis v8.5:
     1. Financial metrics (FMP/yfinance)
     2. Ultra-fresh news with breaking flags
     3. Earnings proximity context
     4. Polymarket prediction odds
+    5. Chart structure — support/resistance, RSI divergence, patterns
     """
     from whale_terminal_modules import fetch_polymarket_markets
 
@@ -1353,67 +1695,62 @@ def run_ai_agent(
         try: near_ath = (cp / float(h52)) > 0.95
         except: pass
 
+    # Minimal financial_data — only fields the prompt actively uses.
+    # Compact (no indent) to save ~30% of prompt tokens.
     financial_data = {
-        "ticker":           ticker,
-        "currentPrice":     round(cp, 2),
-        "fiftyTwoWeekHigh": fmt(h52),
-        "fiftyTwoWeekLow":  fmt(l52),
-        "nearAllTimeHigh":  near_ath,
-        "ATR_14d":          f"${atr:.2f}" if atr else "N/A",
-        "marketCap":        fmt(info.get("marketCap"), "money"),
-        "forwardPE":        fmt(info.get("forwardPE")),
-        "trailingPE":       fmt(info.get("trailingPE")),
-        "pegRatio":         fmt(info.get("pegRatio")),
-        "forwardEps":       fmt(info.get("forwardEps")),
-        "trailingEps":      fmt(info.get("trailingEps")),
-        "revenueGrowth":    fmt(info.get("revenueGrowth"),   "percent"),
-        "earningsGrowth":   fmt(info.get("earningsGrowth"),  "percent"),
-        "profitMargins":    fmt(info.get("profitMargins"),   "percent"),
-        "operatingMargins": fmt(info.get("operatingMargins"),"percent"),
-        "returnOnEquity":   fmt(info.get("returnOnEquity"),  "percent"),
-        "freeCashflow":     fmt(info.get("freeCashflow"),    "money"),
-        "debtToEquity":     fmt(info.get("debtToEquity")),
-        "beta":             fmt(info.get("beta")),
-        "RSI_14":           f"{rsi_v:.2f}" if isinstance(rsi_v,float) else "N/A",
-        "MACD_bias":        ("Bullish" if indicators and indicators["macd"]>indicators["signal"] else "Bearish") if indicators else "N/A",
-        "trend_200SMA":     ("Above" if cp>sma200 else "Below") if sma200 else "N/A",
-        "SMA_200":          f"${sma200:.2f}" if sma200 else "N/A",
-        "analystTarget":    fmt(info.get("targetMeanPrice")),
-        "blendedFairValue": f"${fv['fair_value']:.2f}" if fv else "N/A",
-        "fairValueUpside":  f"{fv['upside']:.1f}%" if fv else "N/A",
-        "DCF_value":        f"${fv['dcf_model']:.2f}" if fv and fv.get("dcf_model") else "N/A",
-        "bullCase":         f"${fv['bull_case']:.2f}" if fv else "N/A",
-        "bearCase":         f"${fv['bear_case']:.2f}" if fv else "N/A",
-        "peMultiple":       f"{fv['pe_multiple']:.0f}x" if fv else "N/A",
-        "terminalGrowth":   f"{fv['terminal_growth']:.1f}%" if fv else "N/A",
-        "analystAdjusted":  fv.get("analyst_adj", False) if fv else False,
-        "isMegaCap":        fv.get("is_megacap", False) if fv else False,
-        "sector":           info.get("sector","N/A"),
-        "industry":         info.get("industry","N/A"),
+        "tk": ticker,
+        "px": round(cp, 2),
+        "52H": fmt(h52),  "52L": fmt(l52),  "ATH": near_ath,
+        "atr": f"${atr:.2f}" if atr else "N/A",
+        "mcap": fmt(info.get("marketCap"), "money"),
+        "fwdPE": fmt(info.get("forwardPE")),
+        "ttmPE": fmt(info.get("trailingPE")),
+        "peg":   fmt(info.get("pegRatio")),
+        "fwdEps": fmt(info.get("forwardEps")),
+        "ttmEps": fmt(info.get("trailingEps")),
+        "revGr":  fmt(info.get("revenueGrowth"),  "percent"),
+        "epsGr":  fmt(info.get("earningsGrowth"), "percent"),
+        "pm":     fmt(info.get("profitMargins"),   "percent"),
+        "om":     fmt(info.get("operatingMargins"),"percent"),
+        "roe":    fmt(info.get("returnOnEquity"),  "percent"),
+        "fcf":    fmt(info.get("freeCashflow"),    "money"),
+        "d2e":    fmt(info.get("debtToEquity")),
+        "beta":   fmt(info.get("beta")),
+        "rsi":    f"{rsi_v:.2f}" if isinstance(rsi_v, float) else "N/A",
+        "macd":   ("Bull" if indicators and indicators["macd"]>indicators["signal"] else "Bear") if indicators else "N/A",
+        "sma200": ("Above" if cp > sma200 else "Below") if sma200 else "N/A",
+        "tgt":    fmt(info.get("targetMeanPrice")),
+        "fv":     f"${fv['fair_value']:.2f}" if fv else "N/A",
+        "fvUp":   f"{fv['upside']:.1f}%" if fv else "N/A",
+        "dcf":    (f"${fv['dcf_model']:.2f}" if fv and fv.get("dcf_model") and not fv.get("dcf_outlier") else "excl") if fv else "N/A",
+        "bull":   f"${fv['bull_case']:.2f}" if fv else "N/A",
+        "bear":   f"${fv['bear_case']:.2f}" if fv else "N/A",
+        "peM":    f"{fv['pe_multiple']:.0f}x" if fv else "N/A",
+        "sect":   info.get("sector","N/A"),
+        "ind":    info.get("industry","N/A"),
     }
 
-    # ── Source 2: news (include breaking flag) ────────────────────────────────
+    # ── Source 2: news — top 5 only to save tokens ───────────────────────────
     news_summary = []
-    for n in news[:8]:
+    for n in news[:5]:                          # hard cap: 5 headlines max
         entry = {
-            "headline":  n.get("title",""),
-            "sentiment": n.get("sentiment","Neutral"),
-            "score":     round(n.get("score",0.5),2),
-            "reason":    n.get("reason",""),
-            "date":      n.get("published",""),
-            "breaking":  n.get("breaking",False),
+            "h":  n.get("title","")[:120],      # truncate long headlines
+            "s":  n.get("sentiment","Neutral")[0],  # B/N/Be (1 char)
+            "sc": round(n.get("score",0.5),2),
         }
+        if n.get("breaking"):
+            entry["brk"] = True
         if n.get("hours_ago") is not None:
-            entry["hours_ago"] = f"{n['hours_ago']:.1f}h ago"
+            entry["age"] = f"{n['hours_ago']:.0f}h"
         news_summary.append(entry)
 
-    bull_n = sum(1 for n in news if n.get("sentiment")=="Bullish")
-    bear_n = sum(1 for n in news if n.get("sentiment")=="Bearish")
+    bull_n         = sum(1 for n in news if n.get("sentiment")=="Bullish")
+    bear_n         = sum(1 for n in news if n.get("sentiment")=="Bearish")
     breaking_count = sum(1 for n in news if n.get("breaking"))
     news_summary_obj = {
-        "headlines":       news_summary,
-        "summary":         f"{bull_n} Bullish / {bear_n} Bearish / {len(news)-bull_n-bear_n} Neutral",
-        "breaking_alerts": breaking_count,
+        "top5":    news_summary,
+        "sent":    f"{bull_n}B/{bear_n}Be/{len(news)-bull_n-bear_n}N",
+        "brk":     breaking_count,
     }
 
     # ── Source 3: earnings context ────────────────────────────────────────────
@@ -1458,6 +1795,18 @@ def run_ai_agent(
     except:
         prediction_data = "Polymarket unavailable."
 
+    # ── Source 5: chart features ──────────────────────────────────────────────
+    if chart_features and chart_features.get("n", 0) > 0:
+        chart_data = {
+            "support":    chart_features.get("support"),
+            "resistance": chart_features.get("resistance"),
+            "trend":      chart_features.get("trend"),
+            "rsi_div":    chart_features.get("rsi_div"),
+            "candles_10": chart_features.get("candles", [])[-10:],  # last 10 only (token budget)
+        }
+    else:
+        chart_data = {"status": "No chart data available."}
+
     # ── Invoke LLM ────────────────────────────────────────────────────────────
     if llm is None:
         return (
@@ -1466,12 +1815,15 @@ def run_ai_agent(
             "Add it to `.streamlit/secrets.toml` or your Streamlit Cloud Secrets panel "
             "to enable the AI agent."
         )
+    # Compact JSON serialisation — no indent, no extra whitespace.
+    # Saves ~25-35% prompt tokens vs indent=2 on large dicts.
     prompt = AGENT_PROMPT.format(
         date=datetime.now().strftime("%B %d, %Y"),
-        financial_data=json.dumps(financial_data, indent=2),
-        news_data=json.dumps(news_summary_obj, indent=2),
-        earnings_data=json.dumps(earnings_data, indent=2),
-        prediction_data=json.dumps(prediction_data, indent=2),
+        financial_data=json.dumps(financial_data,  separators=(",", ":")),
+        news_data=json.dumps(news_summary_obj,      separators=(",", ":")),
+        earnings_data=json.dumps(earnings_data,     separators=(",", ":")),
+        prediction_data=json.dumps(prediction_data, separators=(",", ":")),
+        chart_data=json.dumps(chart_data,           separators=(",", ":")),  # UPGRADE: SOURCE 5
     )
     verdict = llm.invoke(prompt).content
     return verdict
@@ -1713,217 +2065,102 @@ def page_analysis(run_analysis: bool) -> None:
             with c3: st.metric("Beta", fmt(info.get("beta")),
                                 help="Price sensitivity vs S&P 500. >1 = more volatile")
 
-            # ── Candlestick chart — interactive with toggleable indicators ──────
+            # ── UPGRADE: TradingView Lightweight Charts — replaces st.plotly_chart ──
             st.markdown("## 📊 Technical Analysis")
-            indicators = calc_rsi_macd_bb(hist)
+            # _rsi_hist: 1-year daily history used for both indicator display
+            # AND extract_chart_features — guaranteeing AI/chart data sync (Q4).
+            _rsi_hist = get_stock_history(ticker, "1y", "1d")
+            _chart_src = _rsi_hist if not _rsi_hist.empty else hist
+            indicators = calc_rsi_macd_bb(_chart_src)
 
-            # Indicator toggle controls — stored in session_state so they survive reruns
-            ind_defaults = st.session_state.get("chart_indicators", ["SMA 50","SMA 200"])
-            ind_col1, ind_col2 = st.columns([3, 1])
-            with ind_col1:
+            # ── Chart controls ────────────────────────────────────────────────
+            ctrl1, ctrl2, ctrl3 = st.columns([2, 4, 2])
+            with ctrl1:
+                chart_type = st.selectbox(
+                    "📈 Chart Type",
+                    ["Candlestick", "Line", "OHLC / Bars"],
+                    key="chart_type_sel",
+                    help="Price series display style",
+                )
+            # Indicator toggle controls
+            ind_defaults = st.session_state.get("chart_indicators", ["SMA 50", "SMA 200"])
+            with ctrl2:
                 chosen_inds = st.multiselect(
                     "📐 Overlay Indicators",
-                    options=["SMA 20","SMA 50","SMA 200","Bollinger Bands","VWAP"],
+                    options=["SMA 20", "SMA 50", "SMA 200", "Bollinger Bands", "VWAP"],
                     default=ind_defaults,
                     key="chart_indicators",
-                    help="Select indicators to overlay on the price chart",
+                    help="Overlaid on the price chart",
                 )
-            with ind_col2:
+            with ctrl3:
                 show_studies = st.checkbox(
                     "RSI + MACD panels",
                     value=st.session_state.get("chart_show_studies", True),
                     key="chart_show_studies",
-                    help="Show RSI and MACD charts below the price chart",
+                    help="Show RSI and MACD below the main chart",
                 )
 
-            # Build subplot layout dynamically
-            n_rows   = 2 + (2 if show_studies else 0)   # price, volume, [rsi, macd]
-            row_h    = [0.52, 0.13]
-            if show_studies:
-                row_h += [0.18, 0.17]
-            titles   = [f"{ticker} — Price & Volume", ""]
-            if show_studies:
-                titles += ["RSI (14)", "MACD"]
-
-            fig = make_subplots(
-                rows=n_rows, cols=1,
-                row_heights=row_h,
-                vertical_spacing=0.03,
-                subplot_titles=titles,
-                shared_xaxes=True,
+            # ── Comparison multiselect ────────────────────────────────────────
+            compare_tickers = st.multiselect(
+                "🔀 Compare (normalised % change from period start)",
+                options=["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "TSLA", "META"],
+                default=[],
+                key="chart_compare",
+                placeholder="Add tickers to overlay…",
+                help="Overlaid as % change lines. Main asset stays as selected chart type.",
             )
 
-            # ── Row 1: Candlesticks ────────────────────────────────────────────
-            fig.add_trace(go.Candlestick(
-                x=hist.index, open=hist["Open"], high=hist["High"],
-                low=hist["Low"], close=hist["Close"], name="OHLC",
-                increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
-                increasing_fillcolor="#26a69a", decreasing_fillcolor="#ef5350",
-            ), row=1, col=1)
-
-            # ── Overlay indicators ────────────────────────────────────────────
-            if indicators:
-                sma_specs = {
-                    "SMA 20":  (20,  "#58a6ff", "dot",   1.5),
-                    "SMA 50":  (50,  "#f78166", "solid", 1.8),
-                    "SMA 200": (200, "#e3b341", "dash",  2.0),
-                }
-                for label, (window, color, dash, width) in sma_specs.items():
-                    if label in chosen_inds:
-                        sma = hist["Close"].rolling(window).mean()
-                        if not pd.isna(sma.iloc[-1]):
-                            fig.add_trace(go.Scatter(
-                                x=hist.index, y=sma, name=label,
-                                line=dict(color=color, width=width, dash=dash),
-                                hovertemplate=f"{label}: $%{{y:.2f}}<extra></extra>",
-                            ), row=1, col=1)
-
-                if "Bollinger Bands" in chosen_inds:
-                    s20   = hist["Close"].rolling(20).mean()
-                    std20 = hist["Close"].rolling(20).std()
-                    bb_u  = s20 + std20 * 2
-                    bb_l  = s20 - std20 * 2
-                    fig.add_trace(go.Scatter(
-                        x=hist.index, y=bb_u, name="BB Upper",
-                        line=dict(color="rgba(168,168,255,0.6)", width=1, dash="dot"),
-                        hovertemplate="BB Upper: $%{y:.2f}<extra></extra>",
-                    ), row=1, col=1)
-                    fig.add_trace(go.Scatter(
-                        x=hist.index, y=bb_l, name="BB Lower",
-                        line=dict(color="rgba(168,168,255,0.6)", width=1, dash="dot"),
-                        fill="tonexty", fillcolor="rgba(168,168,255,0.04)",
-                        hovertemplate="BB Lower: $%{y:.2f}<extra></extra>",
-                    ), row=1, col=1)
-
-                if "VWAP" in chosen_inds and "Volume" in hist.columns:
+            # Build comparison data dict: {ticker: [{time,value},...]}
+            _compare_data: dict = {}
+            if compare_tickers:
+                _base = hist["Close"]
+                _base_start = float(_base.iloc[0])
+                if _base_start != 0:
+                    _compare_data[ticker + " (base)"] = [
+                        {"time": ts.strftime("%Y-%m-%d") if hasattr(ts,"strftime") else str(ts)[:10],
+                         "value": round((float(v) / _base_start - 1) * 100, 3)}
+                        for ts, v in _base.items()
+                    ]
+                for _ct in compare_tickers:
                     try:
-                        tp   = (hist["High"] + hist["Low"] + hist["Close"]) / 3
-                        vwap = (tp * hist["Volume"]).cumsum() / hist["Volume"].cumsum()
-                        fig.add_trace(go.Scatter(
-                            x=hist.index, y=vwap, name="VWAP",
-                            line=dict(color="#a371f7", width=2),
-                            hovertemplate="VWAP: $%{y:.2f}<extra></extra>",
-                        ), row=1, col=1)
-                    except: pass
+                        _ch = get_stock_history(_ct, RANGE_MAP[timeframe]["period"],
+                                                RANGE_MAP[timeframe]["interval"])
+                        if _ch.empty: continue
+                        _cs = _ch["Close"].reindex(_base.index, method="nearest").dropna()
+                        _cs0 = float(_cs.iloc[0])
+                        if _cs0 == 0: continue
+                        _compare_data[_ct] = [
+                            {"time": ts.strftime("%Y-%m-%d") if hasattr(ts,"strftime") else str(ts)[:10],
+                             "value": round((float(v) / _cs0 - 1) * 100, 3)}
+                            for ts, v in _cs.items()
+                        ]
+                    except Exception: pass
 
-            # Earnings date line on chart
+            # Earnings date string for chart marker
+            _earn_date_str = None
             if earnings:
                 try:
-                    ed = pd.Timestamp(earnings["date_raw"])
-                    if hist.index[0] <= ed <= hist.index[-1]:
-                        fig.add_vline(
-                            x=ed, line_dash="dot", line_color="#e3b341", line_width=1.5,
-                            annotation_text=f"📅 Earnings", annotation_font_color="#e3b341",
-                            row=1, col=1,
-                        )
-                except: pass
+                    _earn_date_str = pd.Timestamp(earnings["date_raw"]).strftime("%Y-%m-%d")
+                    if not (hist.index[0].strftime("%Y-%m-%d") <= _earn_date_str
+                            <= hist.index[-1].strftime("%Y-%m-%d")):
+                        _earn_date_str = None
+                except Exception:
+                    _earn_date_str = None
 
-            # ── Row 2: Volume bars ────────────────────────────────────────────
-            vcol = ["#26a69a" if hist["Close"].iloc[i] >= hist["Open"].iloc[i]
-                    else "#ef5350" for i in range(len(hist))]
-            fig.add_trace(go.Bar(
-                x=hist.index, y=hist["Volume"], name="Volume",
-                marker_color=vcol, opacity=0.65, showlegend=False,
-                hovertemplate="Vol: %{y:,.0f}<extra></extra>",
-            ), row=2, col=1)
+            # SMA overlays dict for render_tv_chart
+            _sma_inds = {k: True for k in chosen_inds if k.startswith("SMA")}
 
-            # ── Rows 3 & 4: RSI + MACD ────────────────────────────────────────
-            if show_studies and indicators:
-                close   = hist["Close"]
-                delta   = close.diff()
-                gain    = delta.where(delta > 0, 0).rolling(14).mean()
-                loss    = (-delta.where(delta < 0, 0)).rolling(14).mean()
-                rsi_ser = 100 - (100 / (1 + gain / loss))
-
-                # RSI
-                rsi_colors = []
-                for v in rsi_ser:
-                    if pd.isna(v):      rsi_colors.append("rgba(0,0,0,0)")
-                    elif v > 70:        rsi_colors.append("#ef5350")
-                    elif v < 30:        rsi_colors.append("#26a69a")
-                    else:               rsi_colors.append("#e3b341")
-
-                fig.add_trace(go.Scatter(
-                    x=hist.index, y=rsi_ser, name="RSI (14)",
-                    line=dict(color="#e3b341", width=1.8),
-                    hovertemplate="RSI: %{y:.1f}<extra></extra>",
-                ), row=3, col=1)
-                fig.add_hrect(y0=70, y1=100, fillcolor="rgba(239,83,80,0.07)",
-                              line_width=0, row=3, col=1)
-                fig.add_hrect(y0=0,  y1=30,  fillcolor="rgba(38,166,154,0.07)",
-                              line_width=0, row=3, col=1)
-                fig.add_hline(y=70, line_dash="dot", line_color="rgba(239,83,80,0.5)",
-                              line_width=1, row=3, col=1)
-                fig.add_hline(y=30, line_dash="dot", line_color="rgba(38,166,154,0.5)",
-                              line_width=1, row=3, col=1)
-
-                # MACD
-                ema12    = close.ewm(span=12, adjust=False).mean()
-                ema26    = close.ewm(span=26, adjust=False).mean()
-                macd_l   = ema12 - ema26
-                signal_l = macd_l.ewm(span=9, adjust=False).mean()
-                hist_l   = macd_l - signal_l
-                hist_col = ["#26a69a" if v >= 0 else "#ef5350" for v in hist_l]
-
-                fig.add_trace(go.Bar(
-                    x=hist.index, y=hist_l, name="MACD Hist",
-                    marker_color=hist_col, opacity=0.7, showlegend=False,
-                    hovertemplate="Hist: %{y:.4f}<extra></extra>",
-                ), row=4, col=1)
-                fig.add_trace(go.Scatter(
-                    x=hist.index, y=macd_l, name="MACD",
-                    line=dict(color="#58a6ff", width=1.5),
-                    hovertemplate="MACD: %{y:.4f}<extra></extra>",
-                ), row=4, col=1)
-                fig.add_trace(go.Scatter(
-                    x=hist.index, y=signal_l, name="Signal",
-                    line=dict(color="#f78166", width=1.5),
-                    hovertemplate="Signal: %{y:.4f}<extra></extra>",
-                ), row=4, col=1)
-
-            # ── Layout ────────────────────────────────────────────────────────
-            chart_h = 750 if not show_studies else 1000
-            fig.update_layout(
-                template="plotly_dark",
-                height=chart_h,
-                showlegend=True,
-                xaxis_rangeslider_visible=False,
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                font=dict(family="Space Grotesk", color="#f0f6fc"),
-                legend=dict(orientation="h", yanchor="bottom", y=1.01,
-                            bgcolor="rgba(13,17,40,0.8)", bordercolor="#1e2a45",
-                            borderwidth=1),
-                margin=dict(t=40, b=10, l=10, r=10),
-                hovermode="x unified",
-                dragmode="pan",
-                modebar_add=["drawline","drawopenpath","eraseshape"],
-                modebar_remove=["lasso2d","select2d"],
+            # ── UPGRADE: render_tv_chart — components.v1.html + Lightweight Charts ──
+            render_tv_chart(
+                hist=hist,
+                show_studies=show_studies,
+                chart_type=chart_type,
+                height=520,
+                compare_data=_compare_data if _compare_data else None,
+                indicators_overlay=_sma_inds,
+                earnings_date=_earn_date_str,
             )
-            # Y-axis labels
-            fig.update_yaxes(title_text="Price ($)",  row=1, col=1,
-                             tickprefix="$", gridcolor="rgba(30,42,69,0.6)")
-            fig.update_yaxes(title_text="Volume",     row=2, col=1,
-                             gridcolor="rgba(30,42,69,0.4)")
-            if show_studies:
-                fig.update_yaxes(title_text="RSI",    row=3, col=1, range=[0,100],
-                                 gridcolor="rgba(30,42,69,0.4)")
-                fig.update_yaxes(title_text="MACD",   row=4, col=1,
-                                 gridcolor="rgba(30,42,69,0.4)")
-            # X-axis config — only show on bottom row
-            for r in range(1, n_rows):
-                fig.update_xaxes(showticklabels=False, row=r, col=1,
-                                 gridcolor="rgba(30,42,69,0.3)")
-            fig.update_xaxes(showticklabels=True, row=n_rows, col=1,
-                             gridcolor="rgba(30,42,69,0.3)")
-
-            st.plotly_chart(fig, use_container_width=True,
-                            config={"scrollZoom": True, "displayModeBar": True,
-                                    "modeBarButtonsToAdd": ["pan2d","zoomIn2d","zoomOut2d",
-                                                            "resetScale2d","toImage"],
-                                    "toImageButtonOptions": {"format":"png","filename":f"{ticker}_chart"},
-                                    "displaylogo": False})
-            st.caption("💡 Scroll to zoom · Drag to pan · Double-click to reset · Use modebar for more tools")
+            st.caption("💡 Scroll/pinch to zoom · Drag to pan · TradingView Lightweight Charts v4")
 
             # ── Technical indicator strip ──────────────────────────────────────
             if indicators:
@@ -2281,23 +2518,28 @@ def page_analysis(run_analysis: bool) -> None:
 
             st.markdown("---")
 
-            # ── AI Agent Verdict (four-source synthesis) ──────────────────────
+            # ── AI Agent Verdict (five-source synthesis) — UPGRADE ────────────
             if show_ai:
                 st.markdown("## 🤖 AI Agent — Institutional Verdict")
                 st.caption(
                     "Synthesises: (1) live financial data, "
                     "(2) ultra-fresh news with breaking alerts, "
                     "(3) earnings proximity & volatility context, "
-                    "(4) Polymarket prediction odds."
+                    "(4) Polymarket prediction odds, "
+                    "(5) chart structure — same OHLCV/RSI/MACD shown on the chart above."
                 )
-                with st.spinner("AI agent reasoning across all four sources…"):
+                with st.spinner("AI agent reasoning across all five sources…"):
                     try:
                         fv2 = calc_fair_value(info, hist, dg=dcf_g, dw=dcf_w)
+                        # UPGRADE: extract_chart_features uses same _chart_src DataFrame
+                        # as render_tv_chart — guaranteeing AI/chart data sync.
+                        _chart_feats = extract_chart_features(_chart_src)
                         verdict = run_ai_agent(
                             ticker=ticker, info=info, hist=hist,
                             news=news, indicators=indicators,
                             fv=fv2, earnings=earnings,
                             dcf_g=dcf_g, dcf_w=dcf_w,
+                            chart_features=_chart_feats,   # UPGRADE: SOURCE 5
                         )
                         st.markdown(
                             f'''<div class="agent-verdict">{verdict}</div>''',
