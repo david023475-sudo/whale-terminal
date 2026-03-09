@@ -120,18 +120,22 @@ hr { border:none; height:1px;
 .stRadio > label { display:none; }
 </style>""", unsafe_allow_html=True)
 
-# ── Phone Mode CSS — only injected when the sidebar toggle is ON ──────────────
-# Root cause of pic3 problem: st.columns renders as a horizontal flexbox.
-# When the viewport is narrow, Streamlit still forces each column into the
-# same fraction of the total width, causing metric labels/values to truncate.
-# Switching flex-direction to "column" on stHorizontalBlock stacks them
-# vertically so each card takes 100% of available width and nothing clips.
+# ── Phone Mode CSS — injected only when toggle is ON ─────────────────────────
 if st.session_state.get("phone_mode", False):
     st.markdown("""<style>
-/* ─── Phone Mode: 450px mobile frame ─────────────────────────────── */
-[data-testid="stApp"] {
-    background: #0e1117 !important;
-}
+/* ═══ Phone Mode ═══════════════════════════════════════════════════════
+   Root cause of tl1 ("P.. $..."): Streamlit's st.columns() creates a
+   horizontal flexbox. On a narrow screen each column gets ~20% width,
+   forcing stMetricLabel to truncate with "...".
+   Fix A — stack columns vertically (flex-direction:column).
+   Fix B — give every column 100% width so labels have room to render.
+   Fix C — remove ALL text-overflow/overflow/white-space constraints on
+            the metric label and value nodes.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+[data-testid="stApp"] { background:#0e1117 !important; }
+
+/* Phone frame — max 450px centred */
 [data-testid="stAppViewContainer"] {
     max-width: 450px !important;
     width: 100% !important;
@@ -139,21 +143,21 @@ if st.session_state.get("phone_mode", False):
     background: #080c1a !important;
     border-left:  1px solid #1e2a45 !important;
     border-right: 1px solid #1e2a45 !important;
-    box-shadow: 0 0 60px rgba(0,0,0,.9) !important;
     min-height: 100vh !important;
     overflow-x: hidden !important;
 }
-[data-testid="stAppViewBlockContainer"],
-.block-container {
+[data-testid="stAppViewBlockContainer"], .block-container {
     max-width: 450px !important;
     padding-left:  14px !important;
     padding-right: 14px !important;
     box-sizing: border-box !important;
     overflow-x: hidden !important;
 }
-/* KEY FIX: stack all st.columns vertically */
+
+/* FIX A+B: Stack columns, full width each */
 [data-testid="stHorizontalBlock"] {
     flex-direction: column !important;
+    align-items: stretch !important;
     gap: 6px !important;
     overflow-x: hidden !important;
 }
@@ -161,79 +165,71 @@ if st.session_state.get("phone_mode", False):
     width: 100% !important;
     min-width: 100% !important;
     max-width: 100% !important;
-    flex: 1 1 100% !important;
-    overflow-x: hidden !important;
-}
-/* Metric cards: full width, no label truncation */
-div[data-testid="stMetric"] {
-    width: 100% !important;
-    min-width: 0 !important;
-    box-sizing: border-box !important;
-    padding: 16px 16px !important;
-    margin-bottom: 6px !important;
-    white-space: normal !important;
-}
-div[data-testid="stMetricValue"] {
-    font-size: 1.25rem !important;
-    white-space: normal !important;
-    word-break: break-word !important;
-}
-div[data-testid="stMetricLabel"] {
-    font-size: 0.73rem !important;
-    white-space: normal !important;
-    word-break: break-word !important;
+    flex: 0 0 100% !important;
     overflow: visible !important;
+}
+
+/* FIX C: Metric label & value — remove ALL clipping */
+[data-testid="stMetric"] {
+    width: 100% !important;
+    box-sizing: border-box !important;
+    padding: 14px 16px !important;
+    margin-bottom: 6px !important;
+}
+/* The label node Streamlit generates: <div data-testid="stMetricLabel"> */
+[data-testid="stMetricLabel"] {
+    overflow: visible !important;
+    white-space: normal !important;
+    text-overflow: unset !important;
+    width: 100% !important;
+    max-width: none !important;
+    font-size: 0.78rem !important;
+    color: #8b949e !important;
+}
+/* Sometimes the label is wrapped in a <label> or <div> child */
+[data-testid="stMetricLabel"] > * {
+    overflow: visible !important;
+    white-space: normal !important;
     text-overflow: unset !important;
 }
-div[data-testid="stMetricDelta"] {
-    font-size: 0.70rem !important;
+[data-testid="stMetricValue"] {
+    overflow: visible !important;
+    white-space: normal !important;
+    text-overflow: unset !important;
+    font-size: 1.25rem !important;
+    color: #f0f6fc !important;
+    word-break: break-word !important;
 }
-/* Plotly charts: contained, horizontal scroll if needed */
+[data-testid="stMetricDelta"] { font-size: 0.72rem !important; }
+
+/* Plotly charts */
 [data-testid="stPlotlyChart"] {
     width: 100% !important;
     max-width: 422px !important;
     overflow-x: auto !important;
 }
 /* DataFrames */
-[data-testid="stDataFrame"],
-[data-testid="stTable"] {
+[data-testid="stDataFrame"], [data-testid="stTable"] {
     width: 100% !important;
     max-width: 422px !important;
     overflow-x: auto !important;
     display: block !important;
 }
-/* Tab bar wraps rather than overflows */
-.stTabs [data-baseweb="tab-list"] {
-    flex-wrap: wrap !important;
-    gap: 4px !important;
-}
-.stTabs [data-baseweb="tab"] {
-    font-size: 0.72rem !important;
-    padding: 5px 8px !important;
-}
-/* Alerts */
-.stAlert {
-    box-sizing: border-box !important;
-    width: 100% !important;
-}
-/* Base font slightly tighter */
+/* Tabs */
+.stTabs [data-baseweb="tab-list"] { flex-wrap: wrap !important; gap: 4px !important; }
+.stTabs [data-baseweb="tab"]      { font-size: 0.72rem !important; padding: 5px 8px !important; }
+
 html { font-size: 14px !important; }
-/* Prevent iOS Safari input zoom */
-input, textarea, select,
-.stTextInput input {
-    font-size: 16px !important;
-}
-/* On actual phones remove decorative border */
+/* Prevent iOS auto-zoom on inputs */
+input, textarea, select, .stTextInput input { font-size: 16px !important; }
+
+/* On actual phones — drop the decorative frame */
 @media (max-width: 480px) {
     [data-testid="stAppViewContainer"] {
-        border: none !important;
-        box-shadow: none !important;
-        max-width: 100% !important;
+        border: none !important; max-width: 100% !important;
     }
-    [data-testid="stAppViewBlockContainer"],
-    .block-container {
-        padding-left:  10px !important;
-        padding-right: 10px !important;
+    [data-testid="stAppViewBlockContainer"], .block-container {
+        padding-left: 10px !important; padding-right: 10px !important;
     }
 }
 </style>""", unsafe_allow_html=True)
@@ -398,14 +394,13 @@ with st.sidebar:
         st.markdown("---")
         render_watchlist_sidebar(wm, USER_ID, st.session_state["analysis_ticker"])
     st.markdown("---")
-    # Phone Mode toggle — fixes compressed metric boxes on narrow screens
-    _pm_val = st.toggle(
+    _pm = st.toggle(
         "📱 Phone Mode",
         value=st.session_state.get("phone_mode", False),
         key="phone_mode_toggle",
-        help="Stacks metric boxes vertically so they are never squished.",
+        help="Stacks metric cards vertically — prevents labels from truncating on narrow screens.",
     )
-    st.session_state["phone_mode"] = _pm_val
+    st.session_state["phone_mode"] = _pm
     st.markdown("---")
     if st.button("🚪 Sign Out",use_container_width=True,key="so_btn"):
         auth.sign_out(); st.rerun()
@@ -1764,26 +1759,32 @@ def page_analysis(run_analysis: bool) -> None:
             with c3: st.metric("Beta", fmt(info.get("beta")),
                                 help="Price sensitivity vs S&P 500. >1 = more volatile")
 
-            # ── Technical Analysis: 4 separate panels (TradingView style) ──────
-            # Each panel is an independent go.Figure with its own Y-axis scale.
-            # This prevents Volume (millions), RSI (0-100) and MACD (tiny)
-            # from rendering on the same axis and overlapping each other.
+            # ── Technical Analysis — TradingView-style multi-panel chart ────────
+            # ONE make_subplots figure: panels share the X-axis so zooming /
+            # panning on any panel moves all panels together.
+            # Each panel has its own independent Y-axis (Price $, Volume, RSI 0-100, MACD).
+            # Overlap fix: pixel-level domain calculations replace fractional row_heights.
             st.markdown("## 📊 Technical Analysis")
 
+            # Fetch 2 years of daily candles so users can scroll far back.
+            # Keep a separate 1-year series for RSI Wilder warm-up accuracy.
             _rsi_hist = get_stock_history(ticker, "1y", "1d")
-            _chart_src = _rsi_hist if not _rsi_hist.empty else hist
+            _disp_hist = get_stock_history(ticker, "2y", "1d")
+            if _disp_hist.empty:
+                _disp_hist = hist
+            _chart_src = _rsi_hist if not _rsi_hist.empty else _disp_hist
             indicators = calc_rsi_macd_bb(_chart_src)
 
-            # ── Controls ─────────────────────────────────────────────────────
-            _ctrl1, _ctrl2, _ctrl3 = st.columns([2, 4, 2])
-            with _ctrl1:
+            # Controls
+            _cc1, _cc2, _cc3 = st.columns([2, 4, 2])
+            with _cc1:
                 _chart_type = st.selectbox(
                     "📈 Chart Type",
                     ["Candlestick", "Line", "OHLC / Bars"],
                     key="chart_type_sel",
                 )
             ind_defaults = st.session_state.get("chart_indicators", ["SMA 50","SMA 200"])
-            with _ctrl2:
+            with _cc2:
                 chosen_inds = st.multiselect(
                     "📐 Overlay Indicators",
                     options=["SMA 20","SMA 50","SMA 200","Bollinger Bands","VWAP"],
@@ -1791,7 +1792,7 @@ def page_analysis(run_analysis: bool) -> None:
                     key="chart_indicators",
                     help="Select indicators to overlay on the price chart",
                 )
-            with _ctrl3:
+            with _cc3:
                 show_studies = st.checkbox(
                     "RSI + MACD panels",
                     value=st.session_state.get("chart_show_studies", True),
@@ -1799,66 +1800,91 @@ def page_analysis(run_analysis: bool) -> None:
                     help="Show RSI and MACD below the price chart",
                 )
 
-            # Shared Plotly config and base layout values
-            _PCFG = {
-                "scrollZoom": True, "displayModeBar": True,
-                "modeBarButtonsToAdd": ["pan2d","zoomIn2d","zoomOut2d","resetScale2d","toImage"],
-                "toImageButtonOptions": {"format":"png","filename":f"{ticker}_chart"},
-                "displaylogo": False,
-            }
-            def _base_layout(h, show_xticklabels=False, title_text=""):
-                return dict(
-                    template="plotly_dark",
-                    height=h,
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    plot_bgcolor="rgba(13,17,40,0.55)",
-                    font=dict(family="Space Grotesk", color="#c9d1d9"),
-                    margin=dict(t=28 if title_text else 4, b=4, l=4, r=60),
-                    hovermode="x unified",
-                    dragmode="pan",
-                    xaxis=dict(
-                        showgrid=True, gridcolor="rgba(30,42,69,0.5)",
-                        rangeslider_visible=False,
-                        showticklabels=show_xticklabels,
-                        tickfont=dict(size=10, color="#8b949e"),
-                        zeroline=False,
-                        linecolor="rgba(30,42,69,0.8)",
-                    ),
-                    yaxis=dict(
-                        showgrid=True, gridcolor="rgba(30,42,69,0.5)",
-                        tickfont=dict(size=10, color="#8b949e"),
-                        zeroline=False, side="right",
-                        linecolor="rgba(30,42,69,0.8)",
-                    ),
-                    modebar_add=["drawline","drawopenpath","eraseshape"],
-                    modebar_remove=["lasso2d","select2d"],
-                    **({"title": dict(text=f"<b>{title_text}</b>",
-                                     font=dict(size=12, color="#8b949e"), x=0.01)} if title_text else {}),
-                )
+            # ── Pixel-accurate domain calculation ────────────────────────────
+            # Assign each panel a target pixel height.  Convert to [0,1] domain
+            # fractions AFTER reserving space for gaps.  This guarantees panels
+            # never overlap regardless of total figure height.
+            _PX_PRICE  = 420   # candle panel
+            _PX_VOL    = 100   # volume panel
+            _PX_RSI    = 130   # RSI panel
+            _PX_MACD   = 140   # MACD panel
+            _PX_GAP    = 18    # gap between panels (pixels)
+            _PX_TOP    = 44    # top margin
+            _PX_BOTTOM = 36    # bottom margin (date labels)
 
-            # ── PANEL 1: Price (500 px) ───────────────────────────────────────
-            _fig_p = go.Figure()
+            if show_studies:
+                _panels_px = [_PX_PRICE, _PX_VOL, _PX_RSI, _PX_MACD]
+                _n_gaps    = 3
+                _total_h   = _PX_PRICE + _PX_VOL + _PX_RSI + _PX_MACD + _n_gaps*_PX_GAP + _PX_TOP + _PX_BOTTOM
+            else:
+                _panels_px = [_PX_PRICE, _PX_VOL]
+                _n_gaps    = 1
+                _total_h   = _PX_PRICE + _PX_VOL + _n_gaps*_PX_GAP + _PX_TOP + _PX_BOTTOM
+
+            # Convert gap pixels to fraction of the plottable area
+            _plot_h  = _total_h - _PX_TOP - _PX_BOTTOM
+            _gap_frac = _PX_GAP / _plot_h
+
+            # Build bottom-up domain list [bottom, top] in [0,1] normalised coords
+            # Plotly domain goes from 0 (bottom) to 1 (top)
+            _panel_fracs = [p / _plot_h for p in _panels_px]
+            _domains = []
+            _cursor  = 0.0
+            for _frac in reversed(_panel_fracs):
+                _domains.insert(0, [_cursor, _cursor + _frac])
+                _cursor += _frac + _gap_frac
+
+            # Build make_subplots with precomputed row_heights (just the ratios)
+            _n_rows = len(_panels_px)
+            fig = make_subplots(
+                rows=_n_rows, cols=1,
+                row_heights=_panel_fracs,
+                vertical_spacing=_gap_frac,
+                shared_xaxes=True,
+                subplot_titles=None,
+            )
+
+            # ── Shared styling ────────────────────────────────────────────────
+            _GRID_COL  = "rgba(30,42,69,0.6)"
+            _GRID_COL2 = "rgba(30,42,69,0.35)"
+            _AXIS_CFG  = dict(
+                showgrid=True, gridcolor=_GRID_COL,
+                zeroline=False, linecolor="#1e2a45",
+                tickfont=dict(size=10, color="#8b949e"),
+                # Force English locale for month names
+                tickformatstops=[
+                    dict(dtickrange=[None, 86400000],       value="%b %d"),
+                    dict(dtickrange=[86400000, 604800000],  value="%b %d"),
+                    dict(dtickrange=[604800000, None],      value="%b %Y"),
+                ],
+            )
+
+            # ── ROW 1: Price panel ────────────────────────────────────────────
             if _chart_type == "Line":
-                _fig_p.add_trace(go.Scatter(
-                    x=hist.index, y=hist["Close"], name=ticker,
+                fig.add_trace(go.Scatter(
+                    x=_disp_hist.index, y=_disp_hist["Close"], name=ticker,
                     line=dict(color="#58a6ff", width=2),
                     hovertemplate=f"{ticker}: $%{{y:.2f}}<extra></extra>",
-                ))
+                ), row=1, col=1)
             elif _chart_type == "OHLC / Bars":
-                _fig_p.add_trace(go.Ohlc(
-                    x=hist.index, open=hist["Open"], high=hist["High"],
-                    low=hist["Low"], close=hist["Close"], name="OHLC",
+                fig.add_trace(go.Ohlc(
+                    x=_disp_hist.index,
+                    open=_disp_hist["Open"], high=_disp_hist["High"],
+                    low=_disp_hist["Low"],   close=_disp_hist["Close"],
+                    name="OHLC",
                     increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
-                ))
-            else:  # Candlestick (default)
-                _fig_p.add_trace(go.Candlestick(
-                    x=hist.index, open=hist["Open"], high=hist["High"],
-                    low=hist["Low"], close=hist["Close"], name="OHLC",
+                ), row=1, col=1)
+            else:  # Candlestick
+                fig.add_trace(go.Candlestick(
+                    x=_disp_hist.index,
+                    open=_disp_hist["Open"], high=_disp_hist["High"],
+                    low=_disp_hist["Low"],   close=_disp_hist["Close"],
+                    name="OHLC",
                     increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
                     increasing_fillcolor="#26a69a",   decreasing_fillcolor="#ef5350",
-                ))
+                ), row=1, col=1)
 
-            # SMA / BB / VWAP overlays on price panel
+            # SMA / BB / VWAP overlays
             if indicators:
                 _sma_map = {
                     "SMA 20":  (20,  "#58a6ff", "dot",   1.4),
@@ -1867,111 +1893,79 @@ def page_analysis(run_analysis: bool) -> None:
                 }
                 for _lbl, (_win, _col, _dsh, _wid) in _sma_map.items():
                     if _lbl in chosen_inds:
-                        _sma = hist["Close"].rolling(_win).mean()
+                        _sma = _disp_hist["Close"].rolling(_win).mean()
                         if not pd.isna(_sma.iloc[-1]):
-                            _fig_p.add_trace(go.Scatter(
-                                x=hist.index, y=_sma, name=_lbl,
+                            fig.add_trace(go.Scatter(
+                                x=_disp_hist.index, y=_sma, name=_lbl,
                                 line=dict(color=_col, width=_wid, dash=_dsh),
                                 hovertemplate=f"{_lbl}: $%{{y:.2f}}<extra></extra>",
-                            ))
+                            ), row=1, col=1)
                 if "Bollinger Bands" in chosen_inds:
-                    _s20 = hist["Close"].rolling(20).mean()
-                    _std = hist["Close"].rolling(20).std()
-                    _bbu = _s20 + _std * 2
-                    _bbl = _s20 - _std * 2
-                    _fig_p.add_trace(go.Scatter(
-                        x=hist.index, y=_bbu, name="BB Upper",
+                    _s20  = _disp_hist["Close"].rolling(20).mean()
+                    _std  = _disp_hist["Close"].rolling(20).std()
+                    _bbu  = _s20 + _std * 2
+                    _bbl  = _s20 - _std * 2
+                    fig.add_trace(go.Scatter(
+                        x=_disp_hist.index, y=_bbu, name="BB Upper",
                         line=dict(color="rgba(163,113,247,0.7)", width=1, dash="dot"),
                         hovertemplate="BB Upper: $%{y:.2f}<extra></extra>",
-                    ))
-                    _fig_p.add_trace(go.Scatter(
-                        x=hist.index, y=_bbl, name="BB Lower",
+                    ), row=1, col=1)
+                    fig.add_trace(go.Scatter(
+                        x=_disp_hist.index, y=_bbl, name="BB Lower",
                         line=dict(color="rgba(163,113,247,0.7)", width=1, dash="dot"),
                         fill="tonexty", fillcolor="rgba(163,113,247,0.05)",
                         hovertemplate="BB Lower: $%{y:.2f}<extra></extra>",
-                    ))
-                if "VWAP" in chosen_inds and "Volume" in hist.columns:
+                    ), row=1, col=1)
+                if "VWAP" in chosen_inds and "Volume" in _disp_hist.columns:
                     try:
-                        _tp  = (hist["High"] + hist["Low"] + hist["Close"]) / 3
-                        _vw  = (_tp * hist["Volume"]).cumsum() / hist["Volume"].cumsum()
-                        _fig_p.add_trace(go.Scatter(
-                            x=hist.index, y=_vw, name="VWAP",
+                        _tp  = (_disp_hist["High"] + _disp_hist["Low"] + _disp_hist["Close"]) / 3
+                        _vw  = (_tp * _disp_hist["Volume"]).cumsum() / _disp_hist["Volume"].cumsum()
+                        fig.add_trace(go.Scatter(
+                            x=_disp_hist.index, y=_vw, name="VWAP",
                             line=dict(color="#a371f7", width=2),
                             hovertemplate="VWAP: $%{y:.2f}<extra></extra>",
-                        ))
+                        ), row=1, col=1)
                     except: pass
 
-            # Earnings marker
             if earnings:
                 try:
                     _ed = pd.Timestamp(earnings["date_raw"])
-                    if hist.index[0] <= _ed <= hist.index[-1]:
-                        _fig_p.add_vline(
+                    if _disp_hist.index[0] <= _ed <= _disp_hist.index[-1]:
+                        fig.add_vline(
                             x=_ed, line_dash="dot", line_color="#e3b341", line_width=1.5,
                             annotation_text="📅 Earnings", annotation_font_color="#e3b341",
                         )
                 except: pass
 
-            _plo = _base_layout(500, show_xticklabels=False)
-            _plo["yaxis"]["tickprefix"] = "$"
-            _plo["legend"] = dict(
-                orientation="h", yanchor="bottom", y=1.01,
-                bgcolor="rgba(13,17,40,0.85)", bordercolor="#1e2a45", borderwidth=1,
-                font=dict(size=11),
-            )
-            _plo["title"] = dict(
-                text=f"<b>{ticker}</b> · {_chart_type}",
-                font=dict(size=13, color="#c9d1d9"), x=0.01,
-            )
-            _fig_p.update_layout(**_plo)
-            st.plotly_chart(_fig_p, use_container_width=True, config=_PCFG)
-
-            # ── PANEL 2: Volume (120 px) ──────────────────────────────────────
-            _vcols = ["#26a69a" if hist["Close"].iloc[_i] >= hist["Open"].iloc[_i]
-                      else "#ef5350" for _i in range(len(hist))]
-            _fig_v = go.Figure(go.Bar(
-                x=hist.index, y=hist["Volume"],
+            # ── ROW 2: Volume panel ───────────────────────────────────────────
+            _vcols = ["#26a69a" if _disp_hist["Close"].iloc[_i] >= _disp_hist["Open"].iloc[_i]
+                      else "#ef5350" for _i in range(len(_disp_hist))]
+            fig.add_trace(go.Bar(
+                x=_disp_hist.index, y=_disp_hist["Volume"],
                 marker_color=_vcols, opacity=0.75,
+                name="Volume", showlegend=False,
                 hovertemplate="Vol: %{y:,.0f}<extra></extra>",
-                showlegend=False,
-            ))
-            _vlo = _base_layout(120, show_xticklabels=False, title_text="Volume")
-            _vlo["yaxis"]["tickformat"] = ".2s"
-            _fig_v.update_layout(**_vlo)
-            st.plotly_chart(_fig_v, use_container_width=True, config=_PCFG)
+            ), row=2, col=1)
 
-            # ── PANELS 3 & 4: RSI + MACD (only when show_studies) ─────────────
+            # ── ROWS 3 & 4: RSI + MACD (only when show_studies) ──────────────
             if show_studies and indicators:
-                _c   = hist["Close"]
+                _c   = _disp_hist["Close"]
                 _d   = _c.diff()
                 _ag  = _d.where(_d > 0, 0.0).ewm(alpha=1/14, adjust=False).mean()
                 _al  = (-_d.where(_d < 0, 0.0)).ewm(alpha=1/14, adjust=False).mean()
                 _rsi = 100 - (100 / (1 + _ag / _al.replace(0, float("nan"))))
 
-                # Panel 3 — RSI (150 px)
-                _fig_r = go.Figure()
-                _fig_r.add_trace(go.Scatter(
-                    x=hist.index, y=_rsi, name="RSI(14)",
+                fig.add_trace(go.Scatter(
+                    x=_disp_hist.index, y=_rsi, name="RSI(14)",
                     line=dict(color="#e3b341", width=1.8),
                     hovertemplate="RSI: %{y:.1f}<extra></extra>",
-                ))
-                _fig_r.add_hrect(y0=70, y1=100,
-                                 fillcolor="rgba(239,83,80,0.07)", line_width=0)
-                _fig_r.add_hrect(y0=0,  y1=30,
-                                 fillcolor="rgba(38,166,154,0.07)", line_width=0)
-                _fig_r.add_hline(y=70, line_dash="dot",
-                                 line_color="rgba(239,83,80,0.55)", line_width=1)
-                _fig_r.add_hline(y=50, line_dash="dot",
-                                 line_color="rgba(139,148,158,0.3)", line_width=1)
-                _fig_r.add_hline(y=30, line_dash="dot",
-                                 line_color="rgba(38,166,154,0.55)", line_width=1)
-                _rlo = _base_layout(150, show_xticklabels=False, title_text="RSI (14)")
-                _rlo["yaxis"]["range"] = [0, 100]
-                _rlo["yaxis"]["tickvals"] = [0, 30, 50, 70, 100]
-                _fig_r.update_layout(**_rlo)
-                st.plotly_chart(_fig_r, use_container_width=True, config=_PCFG)
+                ), row=3, col=1)
+                fig.add_hrect(y0=70, y1=100, fillcolor="rgba(239,83,80,0.07)",   line_width=0, row=3, col=1)
+                fig.add_hrect(y0=0,  y1=30,  fillcolor="rgba(38,166,154,0.07)",  line_width=0, row=3, col=1)
+                fig.add_hline(y=70, line_dash="dot", line_color="rgba(239,83,80,0.55)",  line_width=1, row=3, col=1)
+                fig.add_hline(y=50, line_dash="dot", line_color="rgba(139,148,158,0.25)",line_width=1, row=3, col=1)
+                fig.add_hline(y=30, line_dash="dot", line_color="rgba(38,166,154,0.55)", line_width=1, row=3, col=1)
 
-                # Panel 4 — MACD (165 px) — last panel gets x-axis tick labels
                 _e12   = _c.ewm(span=12, adjust=False).mean()
                 _e26   = _c.ewm(span=26, adjust=False).mean()
                 _macd  = _e12 - _e26
@@ -1979,33 +1973,139 @@ def page_analysis(run_analysis: bool) -> None:
                 _mhist = _macd - _msig
                 _mhcol = ["#26a69a" if v >= 0 else "#ef5350" for v in _mhist]
 
-                _fig_m = go.Figure()
-                _fig_m.add_trace(go.Bar(
-                    x=hist.index, y=_mhist,
+                fig.add_trace(go.Bar(
+                    x=_disp_hist.index, y=_mhist,
                     marker_color=_mhcol, opacity=0.8,
-                    name="Histogram",
+                    name="Histogram", showlegend=False,
                     hovertemplate="Hist: %{y:.4f}<extra></extra>",
-                ))
-                _fig_m.add_trace(go.Scatter(
-                    x=hist.index, y=_macd, name="MACD",
+                ), row=4, col=1)
+                fig.add_trace(go.Scatter(
+                    x=_disp_hist.index, y=_macd, name="MACD",
                     line=dict(color="#58a6ff", width=1.6),
                     hovertemplate="MACD: %{y:.4f}<extra></extra>",
-                ))
-                _fig_m.add_trace(go.Scatter(
-                    x=hist.index, y=_msig, name="Signal",
+                ), row=4, col=1)
+                fig.add_trace(go.Scatter(
+                    x=_disp_hist.index, y=_msig, name="Signal",
                     line=dict(color="#f78166", width=1.4),
                     hovertemplate="Signal: %{y:.4f}<extra></extra>",
-                ))
-                _mlo = _base_layout(165, show_xticklabels=True, title_text="MACD (12, 26, 9)")
-                _mlo["margin"]["b"] = 28
-                _mlo["legend"] = dict(
-                    orientation="h", yanchor="top", y=1.15,
-                    bgcolor="rgba(0,0,0,0)", font=dict(size=10),
-                )
-                _fig_m.update_layout(**_mlo)
-                st.plotly_chart(_fig_m, use_container_width=True, config=_PCFG)
+                ), row=4, col=1)
 
-            st.caption("💡 Scroll to zoom · Drag to pan · Double-click to reset · Click legend items to toggle")
+            # ── Layout ────────────────────────────────────────────────────────
+            fig.update_layout(
+                template="plotly_dark",
+                height=_total_h,
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(13,17,40,0.55)",
+                font=dict(family="Space Grotesk", color="#c9d1d9", size=11),
+                margin=dict(t=_PX_TOP, b=_PX_BOTTOM, l=8, r=72),
+                hovermode="x unified",
+                dragmode="pan",
+                # TradingView-style crosshair cursor
+                newshape=dict(line_color="#58a6ff"),
+                modebar_add=["drawline","drawopenpath","eraseshape"],
+                modebar_remove=["lasso2d","select2d"],
+                legend=dict(
+                    orientation="h", yanchor="bottom", y=1.015,
+                    bgcolor="rgba(13,17,40,0.85)", bordercolor="#1e2a45", borderwidth=1,
+                    font=dict(size=11),
+                ),
+                # Crosshair spike lines — vertical line spanning all panels
+                xaxis=dict(
+                    **_AXIS_CFG,
+                    rangeslider_visible=False,
+                    showspikes=True,
+                    spikemode="across+toaxis",
+                    spikesnap="cursor",
+                    spikecolor="#58a6ff",
+                    spikethickness=1,
+                    spikedash="solid",
+                ),
+            )
+
+            # Y-axis: price panel (row 1) — right side, dollar prefix
+            fig.update_yaxes(
+                row=1, col=1,
+                **_AXIS_CFG,
+                tickprefix="$",
+                side="right",
+                showspikes=True, spikecolor="#58a6ff", spikethickness=1,
+            )
+            # Y-axis: volume panel (row 2)
+            fig.update_yaxes(
+                row=2, col=1,
+                **_AXIS_CFG,
+                tickformat=".2s",
+                side="right",
+                title_text="Vol",
+                title_font=dict(size=10, color="#8b949e"),
+            )
+            # Y-axis: RSI panel (row 3)
+            if show_studies:
+                fig.update_yaxes(
+                    row=3, col=1,
+                    **_AXIS_CFG,
+                    range=[0, 100],
+                    tickvals=[0, 30, 50, 70, 100],
+                    side="right",
+                    title_text="RSI",
+                    title_font=dict(size=10, color="#8b949e"),
+                )
+                # Y-axis: MACD panel (row 4)
+                fig.update_yaxes(
+                    row=4, col=1,
+                    **_AXIS_CFG,
+                    side="right",
+                    title_text="MACD",
+                    title_font=dict(size=10, color="#8b949e"),
+                )
+
+            # X-axes: hide date labels on all rows EXCEPT the bottom row.
+            # The bottom row is whichever is last (studies → row 4; no studies → row 2).
+            _bottom_row = _n_rows
+            for _r in range(1, _n_rows + 1):
+                _show_labels = (_r == _bottom_row)
+                fig.update_xaxes(
+                    row=_r, col=1,
+                    **_AXIS_CFG,
+                    rangeslider_visible=False,
+                    showticklabels=_show_labels,
+                    showspikes=True,
+                    spikemode="across+toaxis",
+                    spikesnap="cursor",
+                    spikecolor="#58a6ff",
+                    spikethickness=1,
+                    spikedash="solid",
+                )
+
+            # Label each panel with a small annotation in the plot margin
+            _panel_labels = {1: f"<b>{ticker}</b>", 2: "Volume"}
+            if show_studies:
+                _panel_labels[3] = "RSI (14)"
+                _panel_labels[4] = "MACD (12,26,9)"
+            for _r, _lbl in _panel_labels.items():
+                fig.add_annotation(
+                    xref=f"x{_r} domain" if _r > 1 else "x domain",
+                    yref=f"y{_r} domain" if _r > 1 else "y domain",
+                    x=0.0, y=1.04,
+                    text=_lbl,
+                    showarrow=False,
+                    font=dict(size=11, color="#8b949e"),
+                    xanchor="left",
+                )
+
+            st.plotly_chart(
+                fig,
+                use_container_width=True,
+                config={
+                    "scrollZoom": True,
+                    "displayModeBar": True,
+                    "modeBarButtonsToAdd": ["pan2d","zoomIn2d","zoomOut2d","resetScale2d","toImage"],
+                    "toImageButtonOptions": {"format":"png","filename":f"{ticker}_chart"},
+                    "displaylogo": False,
+                    "locale": "en",   # force English month names
+                },
+            )
+            st.caption("💡 Scroll to zoom · Drag to pan · Double-click to reset · 2-year history loaded")
 
             # ── Technical indicator strip ──────────────────────────────────────
             if indicators:
