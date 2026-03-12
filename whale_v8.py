@@ -413,25 +413,11 @@ with st.sidebar:
 # =============================================================================
 # SHARED DATA HELPERS — FMP primary, yfinance automatic fallback
 # =============================================================================
-# Dynamic candle intervals — each timeframe automatically uses the most
-# informative candle size (matches TradingView default behaviour).
-# 1D  → 5-min  (intraday detail)
-# 5D  → 15-min (intraday, multi-day view)
-# 1M  → 1-day  (short-term daily candles)
-# 3M  → 1-day  (swing trade view)
-# 6M  → 1-day  (medium-term)
-# 1Y  → 1-day  (standard annual chart)
-# 2Y  → 1-week (weekly candles, less noise)
-# 5Y  → 1-month (long-term monthly trend)
 RANGE_MAP = {
-    "1D":{"period":"1d", "interval":"5m"},
-    "5D":{"period":"5d", "interval":"15m"},
-    "1M":{"period":"1mo","interval":"1d"},
-    "3M":{"period":"3mo","interval":"1d"},
-    "6M":{"period":"6mo","interval":"1d"},
-    "1Y":{"period":"1y", "interval":"1d"},
-    "2Y":{"period":"2y", "interval":"1wk"},
-    "5Y":{"period":"5y", "interval":"1wk"},
+    "1D":{"period":"1d","interval":"5m"},  "5D":{"period":"5d","interval":"15m"},
+    "1M":{"period":"1mo","interval":"1d"}, "3M":{"period":"3mo","interval":"1d"},
+    "6M":{"period":"6mo","interval":"1d"}, "1Y":{"period":"1y","interval":"1d"},
+    "2Y":{"period":"2y","interval":"1wk"}, "5Y":{"period":"5y","interval":"1wk"},
 }
 # Sentinel returned by _fmp_get when FMP actively blocks the request (403 or
 # "Error Message"). Callers test `result is _FMP_BLOCKED` to trigger the yf
@@ -570,13 +556,6 @@ def _yf_info_to_dict(info: dict) -> dict:
         "earningsGrowth":  _f(info.get("earningsGrowth")),
         "quarterlyRevenueGrowth": _f(info.get("revenueGrowth")),
         "sharesOutstanding": _f(info.get("sharesOutstanding")),
-        # Enterprise Value — computed explicitly to match Yahoo Finance formula
-        # EV = MarketCap + TotalDebt − TotalCash
-        "enterpriseValue": (
-            (_f(info.get("marketCap")) or 0) +
-            (_f(info.get("totalDebt")) or 0) -
-            (_f(info.get("totalCash")) or 0)
-        ) if info.get("marketCap") else _f(info.get("enterpriseValue")),
         "_source": "Yahoo Finance",
     }
 
@@ -677,74 +656,43 @@ def get_stock_info(ticker: str) -> dict:
             except (ValueError, IndexError):
                 pass
 
-    # ── 7. Analyst estimates — forward EPS & 5-year growth rate ─────────────
-    # /analyst-estimates provides consensus forwardEps and growth rates used
-    # by Yahoo Finance to compute Forward P/E and PEG.
-    ae: dict = {}
-    ae_data = _fmp_get(f"/analyst-estimates/{ticker}", {"period": "annual", "limit": 1})
-    if ae_data and ae_data is not _FMP_BLOCKED and isinstance(ae_data, list):
-        ae = ae_data[0]
+    # ── 7. Analyst EPS estimates — next fiscal year only ─────────────────────
+    # Yahoo Finance Forward P/E = Current Price / NEXT fiscal year EPS estimate.
+    # FMP /analyst-estimates returns annual rows sorted newest-first.
+    # We fetch limit=4 to have enough rows, then pick the FIRST entry whose
+    # fiscal year end date is strictly in the future (i.e. not yet reported).
+    # This guarantees we always use next-year, never the year after.
+    _fwd_eps   = None   # next-fiscal-year analyst EPS consensus
+    _fwd_pe    = None   # Forward P/E derived from it
+    try:
+        _today_str = datetime.now().strftime("%Y-%m-%d")
+        ae_data = _fmp_get(f"/analyst-estimates/{ticker}",
+                           {"period": "annual", "limit": 4})
+        if ae_data and ae_data is not _FMP_BLOCKED and isinstance(ae_data, list):
+            # FMP rows are newest-first; find the first one whose date is future
+            for _row in ae_data:
+                _row_date = str(_row.get("date", "") or "")
+                if _row_date >= _today_str:          # future fiscal-year end
+                    _eps_candidate = _f(_row.get("estimatedEpsAvg")
+                                        or _row.get("estimatedEps"))
+                    if _eps_candidate is not None:   # accept negative too (loss)
+                        _fwd_eps = _eps_candidate
+                        break
+            # Fallback: if every row is past-dated (e.g. recently reported),
+            # take the most-recent row as the best available estimate.
+            if _fwd_eps is None and ae_data:
+                _eps_candidate = _f(ae_data[0].get("estimatedEpsAvg")
+                                    or ae_data[0].get("estimatedEps"))
+                if _eps_candidate is not None:
+                    _fwd_eps = _eps_candidate
 
-    # ── Derived: Forward EPS (analyst consensus) ─────────────────────────────
-    # Priority: analyst estimate → FMP profile estimatedEps → trailing EPS fallback
-    _fwd_eps = (
-        _f(ae.get("estimatedEpsAvg"))
-        or _f(ae.get("estimatedEps"))
-        or _f(p.get("estimatedEps"))
-        or _f(inc.get("epsdiluted") or p.get("eps"))
-    )
-    _trail_eps = _f(inc.get("epsdiluted") or p.get("eps"))
-
-    # ── Derived: Forward P/E = Current Price / Forward EPS ───────────────────
-    # This matches Yahoo Finance's calculation exactly.
-    _fwd_pe_calc = None
-    if live_price and _fwd_eps and _fwd_eps != 0:
-        _fwd_pe_calc = live_price / _fwd_eps
-    # Fallback to FMP ratios forwardPE if available and our calc failed
-    _fwd_pe = _fwd_pe_calc or _r(ra.get("priceEarningsRatioTTM") or ra.get("priceEarningsRatio"))
-
-    # ── Derived: Enterprise Value = MarketCap + TotalDebt − TotalCash ────────
-    # This is the standard formula used by Yahoo Finance.
-    _market_cap  = _f(qt.get("marketCap")) or _f(p.get("mktCap"))
-    _total_debt  = _f(bs.get("totalDebt") or p.get("totalDebt")) or 0.0
-    _total_cash  = _f(bs.get("cashAndCashEquivalents") or p.get("cash")) or 0.0
-    _ebitda_val  = _f(inc.get("ebitda"))
-    _revenue_val = _f(inc.get("revenue") or p.get("revenue"))
-    _ev = None
-    if _market_cap:
-        _ev = _market_cap + _total_debt - _total_cash
-
-    # ── Derived: EV/EBITDA and EV/Revenue from computed EV ───────────────────
-    # Prefer our computed EV for accuracy; fall back to FMP key-metrics if unavailable.
-    _ev_ebitda  = (_ev / _ebitda_val  if _ev and _ebitda_val  and _ebitda_val  > 0 else None)                   or _r(km.get("enterpriseValueOverEBITDA"))
-    _ev_revenue = (_ev / _revenue_val if _ev and _revenue_val and _revenue_val > 0 else None)                   or _r(km.get("evToSales"))
-
-    # ── Derived: PEG = Forward P/E / Expected EPS Growth Rate (%) ────────────
-    # Yahoo Finance uses 5-year analyst EPS growth estimate.
-    # Analyst estimates endpoint provides estimatedEpsGrowth or we fall back to
-    # our YoY earnings growth rate.
-    _growth_pct = (
-        _f(ae.get("estimatedEpsGrowth"))          # direct analyst 5yr estimate
-        or _f(ae.get("estimatedRevenueGrowth"))    # revenue growth as proxy
-        or (_ni_growth)                            # YoY from income statement
-    )
-    _peg_ratio = None
-    if _fwd_pe and _growth_pct and _growth_pct > 0:
-        # growth_pct might be 0-1 decimal or 0-100; normalise to %
-        _gr_pct = _growth_pct * 100 if abs(_growth_pct) <= 1.0 else _growth_pct
-        if _gr_pct > 0:
-            _peg_ratio = _fwd_pe / _gr_pct
-    # Fallback to km.pegRatio if we couldn't compute
-    _peg_ratio = _peg_ratio or _r(km.get("pegRatio"))
-
-    # ── Free Cash Flow from cash flow statement (more reliable) ──────────────
-    _fcf = _f(inc.get("freeCashFlow"))
-    if _fcf is None:
-        # Reconstruct from per-share × shares
-        _fcf_ps  = _f(ra.get("freeCashFlowPerShareTTM") or ra.get("freeCashFlowPerShare"))
-        _shares  = _f(bs.get("commonStock") or p.get("sharesOutstanding"))
-        if _fcf_ps and _shares:
-            _fcf = _fcf_ps * _shares
+        # Forward P/E: only calculate when EPS is a positive number.
+        # A negative or zero forward EPS produces a meaningless ratio.
+        if _fwd_eps is not None and _fwd_eps > 0 and live_price:
+            _fwd_pe = live_price / _fwd_eps
+    except Exception as _ae_exc:
+        print(f"[analyst-estimates] {ticker}: {_ae_exc}")
+        # _fwd_eps and _fwd_pe remain None — UI will show N/A
 
     return {
         "symbol":   p.get("symbol"),
@@ -761,43 +709,41 @@ def get_stock_info(ticker: str) -> dict:
         "dayHigh":          _f(qt.get("dayHigh")),
         "dayLow":           _f(qt.get("dayLow")),
         "volume":           _f(qt.get("volume"))  or _f(p.get("volAvg")),
-        "marketCap":        _market_cap,
+        "marketCap":        _f(qt.get("marketCap")) or _f(p.get("mktCap")),
         "beta":             _f(p.get("beta")),
         "fiftyTwoWeekHigh": wk52_high,
         "fiftyTwoWeekLow":  wk52_low,
-        # Trailing P/E: price ÷ trailing EPS (TTM)
         "trailingPE":  _r(ra.get("priceEarningsRatioTTM") or ra.get("priceEarningsRatio")),
-        # Forward P/E: price ÷ ANALYST CONSENSUS forward EPS (matches Yahoo Finance)
+        # Forward P/E: price / next-fiscal-year analyst consensus EPS
+        # Returns None when no valid estimate is available (UI shows N/A)
         "forwardPE":   _fwd_pe,
-        # PEG: Forward P/E ÷ expected EPS growth % (analyst 5yr estimate)
-        "pegRatio":    _peg_ratio,
+        "pegRatio":    _r(km.get("pegRatio")),
         "priceToSalesTrailing12Months": _r(ra.get("priceToSalesRatioTTM") or ra.get("priceToSalesRatio")),
         "priceToBook": _r(ra.get("priceToBookRatioTTM") or ra.get("priceToBookRatio")),
-        # EV/EBITDA and EV/Revenue derived from explicitly computed EV
-        "enterpriseToEbitda":  _ev_ebitda,
-        "enterpriseToRevenue": _ev_revenue,
-        # Trailing EPS from income statement (TTM diluted)
-        "trailingEps":     _trail_eps,
-        # Forward EPS from analyst consensus estimates
+        "enterpriseToEbitda":  _r(km.get("enterpriseValueOverEBITDA")),
+        "enterpriseToRevenue": _r(km.get("evToSales")),
+        "trailingEps":     _f(inc.get("epsdiluted") or p.get("eps")),
+        # Forward EPS: next-fiscal-year analyst consensus (None if unavailable)
         "forwardEps":      _fwd_eps,
-        # Enterprise Value explicitly computed: MarketCap + TotalDebt − TotalCash
-        "enterpriseValue": _ev,
         "targetMeanPrice": _f(p.get("dcf")),
         "profitMargins":    _r(ra.get("netProfitMarginTTM")       or ra.get("netProfitMargin")),
         "operatingMargins": _r(ra.get("operatingProfitMarginTTM") or ra.get("operatingProfitMargin")),
         "grossMargins":     _r(ra.get("grossProfitMarginTTM")     or ra.get("grossProfitMargin")),
         "returnOnEquity":   _r(ra.get("returnOnEquityTTM")        or ra.get("returnOnEquity")),
         "returnOnAssets":   _r(ra.get("returnOnAssetsTTM")        or ra.get("returnOnAssets")),
-        "totalDebt":    _total_debt or None,
-        "totalCash":    _total_cash or None,
+        "totalDebt":    _f(bs.get("totalDebt")              or p.get("totalDebt")),
+        "totalCash":    _f(bs.get("cashAndCashEquivalents") or p.get("cash")),
         "debtToEquity": _r(ra.get("debtEquityRatioTTM")     or ra.get("debtEquityRatio")),
         "quickRatio":   _r(ra.get("quickRatioTTM")          or ra.get("quickRatio")),
         "currentRatio": _r(ra.get("currentRatioTTM")        or ra.get("currentRatio")),
         "bookValue":    _f(km.get("bookValuePerShare")),
-        "freeCashflow": _fcf,
+        "freeCashflow": (
+            (_f(ra.get("freeCashFlowPerShareTTM") or ra.get("freeCashFlowPerShare")) or 0) *
+            (_f(bs.get("commonStock") or p.get("sharesOutstanding")) or 1)
+        ) if (ra.get("freeCashFlowPerShareTTM") or ra.get("freeCashFlowPerShare")) else None,
         "operatingCashflow": _f(inc.get("operatingCashFlow")),
-        "totalRevenue":    _revenue_val,
-        "ebitda":          _ebitda_val,
+        "totalRevenue":    _f(inc.get("revenue")    or p.get("revenue")),
+        "ebitda":          _f(inc.get("ebitda")),
         "netIncomeToCommon": _f(inc.get("netIncome")),
         "revenuePerShare": _f(km.get("revenuePerShare")),
         "revenueGrowth":   _rev_growth,
@@ -1041,40 +987,9 @@ def fmt(val, t="number"):
             if v>=1e12: return f"${float(val)/1e12:.2f}T"
             if v>=1e9:  return f"${float(val)/1e9:.2f}B"
             if v>=1e6:  return f"${float(val)/1e6:.2f}M"
-            if v>=1e3:  return f"${float(val)/1e3:.1f}K"
             return f"${float(val):,.2f}"
         return f"{float(val):.2f}"
     except: return "N/A"
-
-def fmt_vol(val) -> str:
-    """Format volume into K / M / B for any display location."""
-    if val is None: return "N/A"
-    try:
-        v = float(val)
-        if v >= 1e9: return f"{v/1e9:.2f}B"
-        if v >= 1e6: return f"{v/1e6:.2f}M"
-        if v >= 1e3: return f"{v/1e3:.1f}K"
-        return f"{v:,.0f}"
-    except: return "N/A"
-
-def _indicator(val, thresholds: dict) -> str:
-    """Return 🟢/🟡/🔴 emoji based on value vs thresholds.
-    thresholds = {"green": (low, high), "yellow": (low, high)} where
-    matching green→🟢, yellow→🟡, else 🔴.
-    Or pass a callable that returns the emoji directly.
-    """
-    if val is None: return ""
-    try:
-        v = float(val)
-        if callable(thresholds): return thresholds(v)
-        if "green" in thresholds:
-            lo, hi = thresholds["green"]
-            if lo <= v <= hi: return "🟢"
-        if "yellow" in thresholds:
-            lo, hi = thresholds["yellow"]
-            if lo <= v <= hi: return "🟡"
-        return "🔴"
-    except: return ""
 
 # ── Technical indicators ──────────────────────────────────────────────────────
 def calc_rsi_macd_bb(hist):
@@ -1843,219 +1758,47 @@ def page_analysis(run_analysis: bool) -> None:
             peers = st.session_state["auto_peers"]
             render_peer_group_info(peers, source="auto")
 
-            # ══════════════════════════════════════════════════════════════════
-            # DASHBOARD — Bloomberg/TradingView-style structured metric layout
-            # ══════════════════════════════════════════════════════════════════
-
-            # ── Section 1: Summary ────────────────────────────────────────────
-            st.markdown("## 📊 Summary")
-            _mc  = info.get("marketCap")
-            _rev = info.get("totalRevenue")
-            _ni  = info.get("netIncomeToCommon")
-            _rg  = info.get("revenueGrowth")
-            _roe = info.get("returnOnEquity")
-            _hw  = info.get("fiftyTwoWeekHigh")
-            _lw  = info.get("fiftyTwoWeekLow")
-
-            _sm1,_sm2,_sm3,_sm4,_sm5,_sm6 = st.columns(6)
-            with _sm1:
-                st.metric("Price", f"${cp:.2f}",
-                          f"{chg:+.2f} ({chgp:+.2f}%)",
-                          help="Current price vs previous close")
-            with _sm2:
-                st.metric("Market Cap", fmt(_mc, "money"),
-                          help="Total market capitalisation")
-            with _sm3:
-                st.metric("Revenue (TTM)", fmt(_rev, "money"),
-                          help="Trailing twelve-month total revenue")
-            with _sm4:
-                st.metric("Net Income", fmt(_ni, "money"),
-                          help="Trailing twelve-month net income")
-            with _sm5:
-                _rg_str = f"{_rg*100:+.1f}%" if _rg is not None else "N/A"
-                _rg_ind = ("🟢" if _rg and _rg > 0.10 else
-                           "🟡" if _rg and _rg > 0 else "🔴") if _rg is not None else ""
-                st.metric("Revenue Growth", f"{_rg_str} {_rg_ind}",
-                          help="Year-over-year revenue growth rate")
-            with _sm6:
-                _roe_pct = f"{_roe*100:.1f}%" if _roe is not None else "N/A"
-                _roe_ind = ("🟢" if _roe and _roe > 0.20 else
-                            "🟡" if _roe and _roe > 0.10 else "🔴") if _roe is not None else ""
-                st.metric("ROE", f"{_roe_pct} {_roe_ind}",
-                          help="Return on Equity — measures profitability vs shareholder equity")
-
+            # ── Market snapshot ────────────────────────────────────────────────
+            st.markdown("## 📈 Market Snapshot")
+            c1,c2,c3,c4,c5 = st.columns(5)
+            with c1: st.metric("Price", f"${cp:.2f}", f"{chg:+.2f} ({chgp:+.2f}%)",
+                                help="Current price vs previous close")
+            with c2: st.metric("Market Cap", fmt(info.get("marketCap"),"money"),
+                                help="Total market capitalisation")
+            with c3: st.metric("Volume", f"{hist['Volume'].iloc[-1]:,.0f}",
+                                help="Shares traded in latest period")
+            with c4:
+                hw = info.get("fiftyTwoWeekHigh")
+                st.metric("52W High", f"${float(hw):.2f}" if hw else "N/A",
+                           help="Highest price in last 52 weeks")
+            with c5:
+                lw = info.get("fiftyTwoWeekLow")
+                st.metric("52W Low",  f"${float(lw):.2f}" if lw else "N/A",
+                           help="Lowest price in last 52 weeks")
             st.caption(f"Source: **{src}** · Sector: **{sector}** · Industry: **{industry}** "
                        f"· {datetime.now():%Y-%m-%d %H:%M:%S}")
 
-            # ── Section 2: Valuation ──────────────────────────────────────────
-            st.markdown("## 💰 Valuation")
-            _fpe = info.get("forwardPE")
-            _tpe = info.get("trailingPE")
-            _peg = info.get("pegRatio")
-            _ps  = info.get("priceToSalesTrailing12Months")
-            _pb  = info.get("priceToBook")
-            _ev_eb = info.get("enterpriseToEbitda")
+            # ── Valuation metrics ──────────────────────────────────────────────
+            st.markdown("## 💰 Valuation Metrics")
+            c1,c2,c3,c4 = st.columns(4)
+            with c1: st.metric("Forward P/E",  fmt(info.get("forwardPE")),
+                                help="Price ÷ next-year EPS estimate")
+            with c2: st.metric("P/E (TTM)",    fmt(info.get("trailingPE")),
+                                help="Price ÷ trailing 12-month EPS")
+            with c3: st.metric("PEG Ratio",    fmt(info.get("pegRatio")),
+                                help="P/E ÷ earnings growth rate. <1 = undervalued")
+            with c4: st.metric("Price / Sales",fmt(info.get("priceToSalesTrailing12Months")),
+                                help="Market cap ÷ annual revenue")
 
-            # P/E indicator: <15 green, 15-30 yellow, >30 red
-            def _pe_ind(v):
-                if v is None: return ""
-                return "🟢" if v < 15 else "🟡" if v < 30 else "🔴"
-            # PEG indicator: <1 green, 1-2 yellow, >2 red
-            def _peg_ind(v):
-                if v is None: return ""
-                return "🟢" if v < 1 else "🟡" if v < 2 else "🔴"
-
-            _va1,_va2,_va3,_va4,_va5,_va6 = st.columns(6)
-            with _va1:
-                st.metric("Forward P/E",
-                          f"{fmt(_fpe)} {_pe_ind(_fpe)}",
-                          help="Price ÷ analyst consensus forward EPS (matches Yahoo Finance)")
-            with _va2:
-                st.metric("P/E (TTM)",
-                          f"{fmt(_tpe)} {_pe_ind(_tpe)}",
-                          help="Price ÷ trailing 12-month EPS")
-            with _va3:
-                st.metric("PEG Ratio",
-                          f"{fmt(_peg)} {_peg_ind(_peg)}",
-                          help="P/E ÷ expected EPS growth %. <1 = potentially undervalued")
-            with _va4:
-                _ps_ind = "🟢" if _ps and _ps < 3 else "🟡" if _ps and _ps < 8 else "🔴" if _ps else ""
-                st.metric("Price / Sales",
-                          f"{fmt(_ps)} {_ps_ind}",
-                          help="Market cap ÷ annual revenue (TTM)")
-            with _va5:
-                _pb_ind = "🟢" if _pb and _pb < 3 else "🟡" if _pb and _pb < 6 else "🔴" if _pb else ""
-                st.metric("Price / Book",
-                          f"{fmt(_pb)} {_pb_ind}",
-                          help="Market cap ÷ book value of equity")
-            with _va6:
-                _eveb_ind = "🟢" if _ev_eb and _ev_eb < 15 else "🟡" if _ev_eb and _ev_eb < 25 else "🔴" if _ev_eb else ""
-                st.metric("EV / EBITDA",
-                          f"{fmt(_ev_eb)} {_eveb_ind}",
-                          help="Enterprise Value ÷ EBITDA. Computed: EV = MarketCap + Debt − Cash")
-
-            # Enterprise Value detail line
-            _ev_raw = info.get("enterpriseValue")
-            if _ev_raw:
-                st.caption(f"🏢 Enterprise Value: **{fmt(_ev_raw, 'money')}** "
-                           f"(MarketCap {fmt(_mc,'money')} + Debt {fmt(info.get('totalDebt'),'money')} "
-                           f"− Cash {fmt(info.get('totalCash'),'money')})")
-
-            # ── Section 3: Profitability ──────────────────────────────────────
-            st.markdown("## 📈 Profitability")
-            _pm  = info.get("profitMargins")
-            _om  = info.get("operatingMargins")
-            _gm  = info.get("grossMargins")
-            _roa = info.get("returnOnAssets")
-            _eps = info.get("trailingEps")
-            _feps= info.get("forwardEps")
-
-            def _margin_ind(v):
-                if v is None: return ""
-                return "🟢" if v > 0.15 else "🟡" if v > 0.05 else "🔴"
-
-            _pr1,_pr2,_pr3,_pr4,_pr5,_pr6 = st.columns(6)
-            with _pr1:
-                st.metric("Profit Margin",
-                          f"{fmt(_pm,'percent')} {_margin_ind(_pm)}",
-                          help="Net income ÷ revenue")
-            with _pr2:
-                st.metric("Operating Margin",
-                          f"{fmt(_om,'percent')} {_margin_ind(_om)}",
-                          help="Operating income ÷ revenue")
-            with _pr3:
-                st.metric("Gross Margin",
-                          f"{fmt(_gm,'percent')} {'🟢' if _gm and _gm>0.40 else '🟡' if _gm and _gm>0.20 else '🔴' if _gm else ''}",
-                          help="Gross profit ÷ revenue")
-            with _pr4:
-                _roe_ind2 = "🟢" if _roe and _roe > 0.20 else "🟡" if _roe and _roe > 0.10 else "🔴" if _roe else ""
-                st.metric("ROE",
-                          f"{fmt(_roe,'percent')} {_roe_ind2}",
-                          help="Return on Equity")
-            with _pr5:
-                _roa_ind = "🟢" if _roa and _roa > 0.08 else "🟡" if _roa and _roa > 0.03 else "🔴" if _roa else ""
-                st.metric("ROA",
-                          f"{fmt(_roa,'percent')} {_roa_ind}",
-                          help="Return on Assets")
-            with _pr6:
-                st.metric("EPS (TTM)",
-                          f"${fmt(_eps)}" if _eps is not None else "N/A",
-                          f"Fwd: ${fmt(_feps)}" if _feps is not None else "",
-                          help="Trailing EPS (TTM) with analyst forward EPS delta")
-
-            # ── Section 4: Financial Strength ─────────────────────────────────
-            st.markdown("## 💪 Financial Strength")
-            _cash = info.get("totalCash")
-            _debt = info.get("totalDebt")
-            _de   = info.get("debtToEquity")
-            _cr   = info.get("currentRatio")
-            _fcf  = info.get("freeCashflow")
-            _ocf  = info.get("operatingCashflow")
-
-            _fs1,_fs2,_fs3,_fs4,_fs5,_fs6 = st.columns(6)
-            with _fs1:
-                st.metric("Total Cash", fmt(_cash, "money"),
-                          help="Cash and cash equivalents")
-            with _fs2:
-                st.metric("Total Debt", fmt(_debt, "money"),
-                          help="Short-term + long-term debt")
-            with _fs3:
-                _de_ind = "🟢" if _de and _de < 50 else "🟡" if _de and _de < 100 else "🔴" if _de else ""
-                st.metric("Debt / Equity",
-                          f"{fmt(_de)} {_de_ind}",
-                          help="Total debt ÷ shareholder equity. Lower is safer.")
-            with _fs4:
-                _cr_ind = "🟢" if _cr and _cr > 2 else "🟡" if _cr and _cr > 1 else "🔴" if _cr else ""
-                st.metric("Current Ratio",
-                          f"{fmt(_cr)} {_cr_ind}",
-                          help="Current assets ÷ current liabilities. >2 = healthy")
-            with _fs5:
-                st.metric("Free Cash Flow", fmt(_fcf, "money"),
-                          help="Operating cash flow minus capex")
-            with _fs6:
-                st.metric("Operating Cash Flow", fmt(_ocf, "money"),
-                          help="Cash generated from operations")
-
-            # ── Section 5: Growth ─────────────────────────────────────────────
-            st.markdown("## 📉 Growth")
-            _eg  = info.get("earningsGrowth")
-            _vol = info.get("volume")
-            _beta = info.get("beta")
-
-            _gr1,_gr2,_gr3,_gr4 = st.columns(4)
-            with _gr1:
-                _rg_ind2 = "🟢" if _rg and _rg > 0.10 else "🟡" if _rg and _rg > 0 else "🔴" if _rg is not None else ""
-                st.metric("Revenue Growth (YoY)",
-                          f"{fmt(_rg,'percent')} {_rg_ind2}",
-                          help="Year-over-year revenue growth")
-            with _gr2:
-                _eg_ind = "🟢" if _eg and _eg > 0.10 else "🟡" if _eg and _eg > 0 else "🔴" if _eg is not None else ""
-                st.metric("Earnings Growth (YoY)",
-                          f"{fmt(_eg,'percent')} {_eg_ind}",
-                          help="Year-over-year earnings growth")
-            with _gr3:
-                _beta_ind = "🟢" if _beta and _beta < 1 else "🟡" if _beta and _beta < 1.5 else "🔴" if _beta else ""
-                st.metric("Beta",
-                          f"{fmt(_beta)} {_beta_ind}",
-                          help="Price sensitivity vs S&P 500. >1 = more volatile")
-            with _gr4:
-                hw = info.get("fiftyTwoWeekHigh")
-                lw = info.get("fiftyTwoWeekLow")
-                _range_str = (f"${float(lw):.2f} – ${float(hw):.2f}" if hw and lw else "N/A")
-                # Position within 52W range
-                _range_pos = f"{(cp - float(lw)) / (float(hw) - float(lw)) * 100:.0f}% of range" if (hw and lw and float(hw) != float(lw)) else ""
-                st.metric("52W Range", _range_str, _range_pos,
-                          help="52-week price range and current position within it")
-
-            # ── Quality score (compact) ───────────────────────────────────────
+            # ── Quality score ──────────────────────────────────────────────────
             sc, desc, emoji = quality_score(info.get("returnOnEquity"), info.get("profitMargins"))
-            _qs1, _qs2 = st.columns([1, 3])
-            with _qs1:
-                st.metric("Quality Score", f"{sc}/10 {emoji}",
-                          help="Composite: ROE + profit margin (max 10)")
-            with _qs2:
-                st.info(f"**{desc}**  |  Volume: {fmt_vol(_vol)}  |  "
-                        f"52W High: ${float(hw):.2f}  |  52W Low: ${float(lw):.2f}" if hw and lw else f"**{desc}**")
+            st.markdown("## 🎯 Quality Assessment")
+            c1,c2,c3 = st.columns([2,2,1])
+            with c1: st.metric("Quality Score", f"{sc}/10 {emoji}",
+                                help="Composite: ROE + profit margin (max 10)")
+            with c2: st.info(f"**{desc}**")
+            with c3: st.metric("Beta", fmt(info.get("beta")),
+                                help="Price sensitivity vs S&P 500. >1 = more volatile")
 
             # ── Technical Analysis — TradingView-style multi-panel chart ────────
             # ONE make_subplots figure: panels share the X-axis so zooming /
@@ -2238,13 +1981,11 @@ def page_analysis(run_analysis: bool) -> None:
             # ── ROW 2: Volume panel ───────────────────────────────────────────
             _vcols = ["#26a69a" if _disp_hist["Close"].iloc[_i] >= _disp_hist["Open"].iloc[_i]
                       else "#ef5350" for _i in range(len(_disp_hist))]
-            # Volume panel — K/M/B formatted hover labels
-            # Plotly SI suffix (.3s) gives e.g. "3.45M", "12.5K" automatically.
             fig.add_trace(go.Bar(
                 x=_disp_hist.index, y=_disp_hist["Volume"],
                 marker_color=_vcols, opacity=0.75,
                 name="Volume", showlegend=False,
-                hovertemplate="Vol: %{y:.3s}<extra></extra>",
+                hovertemplate="Vol: %{y:,.0f}<extra></extra>",
             ), row=2, col=1)
 
             # ── ROWS 3 & 4: RSI + MACD (only when show_studies) ──────────────
@@ -2309,14 +2050,14 @@ def page_analysis(run_analysis: bool) -> None:
                     bgcolor="rgba(13,17,40,0.85)", bordercolor="#1e2a45", borderwidth=1,
                     font=dict(size=11),
                 ),
-                # TradingView-style crosshair — thin (0.5px), low-contrast, precise
+                # Crosshair spike lines — vertical line spanning all panels
                 xaxis=dict(
                     **_AXIS_CFG,
                     rangeslider_visible=False,
                     showspikes=True,
                     spikemode="across+toaxis",
                     spikesnap="cursor",
-                    spikecolor="rgba(139,148,158,0.7)",
+                    spikecolor="rgba(139,148,158,0.45)",
                     spikethickness=0.5,
                     spikedash="solid",
                 ),
@@ -2328,16 +2069,13 @@ def page_analysis(run_analysis: bool) -> None:
                 **_AXIS_CFG,
                 tickprefix="$",
                 side="right",
-                showspikes=True,
-                spikecolor="rgba(139,148,158,0.7)",
-                spikethickness=0.5,
-                spikedash="solid",
+                showspikes=True, spikecolor="rgba(139,148,158,0.45)", spikethickness=0.5,
             )
             # Y-axis: volume panel (row 2)
             fig.update_yaxes(
                 row=2, col=1,
                 **_AXIS_CFG,
-                tickformat=".3s",
+                tickformat=".2s",
                 side="right",
                 title_text="Vol",
                 title_font=dict(size=10, color="#8b949e"),
@@ -2375,7 +2113,7 @@ def page_analysis(run_analysis: bool) -> None:
                     showspikes=True,
                     spikemode="across+toaxis",
                     spikesnap="cursor",
-                    spikecolor="rgba(139,148,158,0.7)",
+                    spikecolor="rgba(139,148,158,0.45)",
                     spikethickness=0.5,
                     spikedash="solid",
                 )
@@ -2489,109 +2227,66 @@ def page_analysis(run_analysis: bool) -> None:
                 )
 
             with t1:
-                st.markdown("#### Margins")
-                _ta1,_ta2,_ta3 = st.columns(3)
-                _pm2 = info.get("profitMargins")
-                _om2 = info.get("operatingMargins")
-                _gm2 = info.get("grossMargins")
-                with _ta1:
-                    _ind = "🟢" if _pm2 and _pm2>0.15 else "🟡" if _pm2 and _pm2>0.05 else "🔴" if _pm2 else ""
-                    st.metric("Profit Margin", f"{fmt(_pm2,'percent')} {_ind}")
-                with _ta2:
-                    _ind = "🟢" if _om2 and _om2>0.15 else "🟡" if _om2 and _om2>0.05 else "🔴" if _om2 else ""
-                    st.metric("Operating Margin", f"{fmt(_om2,'percent')} {_ind}")
-                with _ta3:
-                    _ind = "🟢" if _gm2 and _gm2>0.40 else "🟡" if _gm2 and _gm2>0.20 else "🔴" if _gm2 else ""
-                    st.metric("Gross Margin", f"{fmt(_gm2,'percent')} {_ind}")
-                st.markdown("#### Returns & Earnings")
-                _tb1,_tb2,_tb3,_tb4,_tb5 = st.columns(5)
-                _roe2 = info.get("returnOnEquity"); _roa2 = info.get("returnOnAssets")
-                with _tb1:
-                    _ind = "🟢" if _roe2 and _roe2>0.20 else "🟡" if _roe2 and _roe2>0.10 else "🔴" if _roe2 else ""
-                    st.metric("ROE", f"{fmt(_roe2,'percent')} {_ind}")
-                with _tb2:
-                    _ind = "🟢" if _roa2 and _roa2>0.08 else "🟡" if _roa2 and _roa2>0.03 else "🔴" if _roa2 else ""
-                    st.metric("ROA", f"{fmt(_roa2,'percent')} {_ind}")
-                with _tb3: st.metric("Revenue (TTM)", fmt(info.get("totalRevenue"),"money"))
-                with _tb4: st.metric("Net Income",    fmt(info.get("netIncomeToCommon"),"money"))
-                with _tb5: st.metric("EBITDA",        fmt(info.get("ebitda"),"money"))
-                _tc1,_tc2,_tc3 = st.columns(3)
-                with _tc1: st.metric("EPS (TTM)", f"${fmt(info.get('trailingEps'))}", help="Trailing diluted EPS")
-                with _tc2: st.metric("EPS (Fwd)",  f"${fmt(info.get('forwardEps'))}", help="Analyst consensus forward EPS")
-                with _tc3: st.metric("Free Cash Flow", fmt(info.get("freeCashflow"),"money"))
+                ca,cb = st.columns(2)
+                with ca:
+                    st.table(_kv([
+                        ("Profit Margin",   fmt(info.get("profitMargins"),   "percent")),
+                        ("Operating Margin",fmt(info.get("operatingMargins"),"percent")),
+                        ("Gross Margin",    fmt(info.get("grossMargins"),    "percent")),
+                        ("ROE",             fmt(info.get("returnOnEquity"),  "percent")),
+                        ("ROA",             fmt(info.get("returnOnAssets"),  "percent")),
+                    ]))
+                with cb:
+                    st.table(_kv([
+                        ("Revenue (TTM)", fmt(info.get("totalRevenue"),      "money")),
+                        ("Net Income",    fmt(info.get("netIncomeToCommon"), "money")),
+                        ("EBITDA",        fmt(info.get("ebitda"),            "money")),
+                        ("EPS (TTM)",     fmt(info.get("trailingEps"))),
+                        ("EPS (Fwd)",     fmt(info.get("forwardEps"))),
+                    ]))
 
             with t2:
-                st.markdown("#### Liquidity")
-                _ba1,_ba2,_ba3,_ba4 = st.columns(4)
-                _qr = info.get("quickRatio"); _cr2 = info.get("currentRatio")
-                with _ba1: st.metric("Total Cash", fmt(info.get("totalCash"),"money"))
-                with _ba2: st.metric("Total Debt", fmt(info.get("totalDebt"),"money"))
-                with _ba3:
-                    _ind = "🟢" if _qr and _qr>1.5 else "🟡" if _qr and _qr>1 else "🔴" if _qr else ""
-                    st.metric("Quick Ratio", f"{fmt(_qr)} {_ind}")
-                with _ba4:
-                    _ind = "🟢" if _cr2 and _cr2>2 else "🟡" if _cr2 and _cr2>1 else "🔴" if _cr2 else ""
-                    st.metric("Current Ratio", f"{fmt(_cr2)} {_ind}")
-                st.markdown("#### Leverage & Cash Flow")
-                _bb1,_bb2,_bb3,_bb4 = st.columns(4)
-                _de2 = info.get("debtToEquity")
-                with _bb1:
-                    _ind = "🟢" if _de2 and _de2<50 else "🟡" if _de2 and _de2<100 else "🔴" if _de2 else ""
-                    st.metric("Debt / Equity", f"{fmt(_de2)} {_ind}")
-                with _bb2: st.metric("Free Cash Flow",  fmt(info.get("freeCashflow"),"money"))
-                with _bb3: st.metric("Op. Cash Flow",   fmt(info.get("operatingCashflow"),"money"))
-                with _bb4: st.metric("Book Value / Sh", f"${fmt(info.get('bookValue'))}")
-                # EV breakdown
-                _ev2 = info.get("enterpriseValue")
-                if _ev2:
-                    st.info(f"🏢 **Enterprise Value: {fmt(_ev2,'money')}** "
-                            f"= {fmt(info.get('marketCap'),'money')} market cap "
-                            f"+ {fmt(info.get('totalDebt'),'money')} debt "
-                            f"− {fmt(info.get('totalCash'),'money')} cash")
+                ca,cb = st.columns(2)
+                with ca:
+                    st.table(_kv([
+                        ("Total Cash",    fmt(info.get("totalCash"),    "money")),
+                        ("Total Debt",    fmt(info.get("totalDebt"),    "money")),
+                        ("Quick Ratio",   fmt(info.get("quickRatio"))),
+                        ("Current Ratio", fmt(info.get("currentRatio"))),
+                    ]))
+                with cb:
+                    st.table(_kv([
+                        ("Debt/Equity",   fmt(info.get("debtToEquity"))),
+                        ("Free Cash Flow",fmt(info.get("freeCashflow"),      "money")),
+                        ("Op. Cash Flow", fmt(info.get("operatingCashflow"), "money")),
+                        ("Book Value/Sh", fmt(info.get("bookValue"))),
+                    ]))
 
             with t3:
-                _rg3 = info.get("revenueGrowth"); _eg3 = info.get("earningsGrowth")
-                _ga1,_ga2,_ga3,_ga4 = st.columns(4)
-                with _ga1:
-                    _ind = "🟢" if _rg3 and _rg3>0.10 else "🟡" if _rg3 and _rg3>0 else "🔴" if _rg3 is not None else ""
-                    st.metric("Revenue Growth", f"{fmt(_rg3,'percent')} {_ind}")
-                with _ga2:
-                    _ind = "🟢" if _eg3 and _eg3>0.10 else "🟡" if _eg3 and _eg3>0 else "🔴" if _eg3 is not None else ""
-                    st.metric("EPS Growth", f"{fmt(_eg3,'percent')} {_ind}")
-                with _ga3:
-                    st.metric("Revenue / Share", f"${fmt(info.get('revenuePerShare'))}")
-                with _ga4:
-                    _qrg = info.get("quarterlyRevenueGrowth")
-                    _ind = "🟢" if _qrg and _qrg>0.05 else "🟡" if _qrg and _qrg>0 else "🔴" if _qrg is not None else ""
-                    st.metric("Qtrly Rev Growth", f"{fmt(_qrg,'percent')} {_ind}")
-                st.info(f"**Sector:** {sector or 'N/A'}  |  **Industry:** {industry or 'N/A'}  |  **Source:** {src}")
+                ca,cb = st.columns(2)
+                with ca:
+                    st.table(_kv([
+                        ("Rev Growth",       fmt(info.get("revenueGrowth"),          "percent")),
+                        ("EPS Growth",       fmt(info.get("earningsGrowth"),          "percent")),
+                        ("Rev/Share",        fmt(info.get("revenuePerShare"))),
+                        ("Qtrly Rev Growth", fmt(info.get("quarterlyRevenueGrowth"), "percent")),
+                    ]))
+                with cb:
+                    st.info(f"**Sector:** {sector or 'N/A'}\n\n"
+                            f"**Industry:** {industry or 'N/A'}\n\n"
+                            f"**Source:** {src}")
 
             with t4:
-                _fpe3=info.get("forwardPE"); _tpe3=info.get("trailingPE")
-                _peg3=info.get("pegRatio"); _ps3=info.get("priceToSalesTrailing12Months")
-                _pb3=info.get("priceToBook"); _eveb3=info.get("enterpriseToEbitda")
-                _evrev3=info.get("enterpriseToRevenue"); _at3=info.get("targetMeanPrice")
-                _va4a,_va4b,_va4c,_va4d = st.columns(4)
-                def _pei(v): return "🟢" if v and v<15 else "🟡" if v and v<30 else "🔴" if v else ""
-                def _pgi(v): return "🟢" if v and v<1 else "🟡" if v and v<2 else "🔴" if v else ""
-                with _va4a:
-                    st.metric("P/E (TTM)",   f"{fmt(_tpe3)} {_pei(_tpe3)}")
-                    st.metric("PEG Ratio",   f"{fmt(_peg3)} {_pgi(_peg3)}")
-                with _va4b:
-                    st.metric("P/E (Fwd)",   f"{fmt(_fpe3)} {_pei(_fpe3)}", help="Price ÷ analyst forward EPS")
-                    _ps3i="🟢" if _ps3 and _ps3<3 else "🟡" if _ps3 and _ps3<8 else "🔴" if _ps3 else ""
-                    st.metric("Price/Sales", f"{fmt(_ps3)} {_ps3i}")
-                with _va4c:
-                    _pb3i="🟢" if _pb3 and _pb3<3 else "🟡" if _pb3 and _pb3<6 else "🔴" if _pb3 else ""
-                    st.metric("Price/Book",  f"{fmt(_pb3)} {_pb3i}")
-                    _eb3i="🟢" if _eveb3 and _eveb3<15 else "🟡" if _eveb3 and _eveb3<25 else "🔴" if _eveb3 else ""
-                    st.metric("EV/EBITDA",   f"{fmt(_eveb3)} {_eb3i}", help="EV = MarketCap + Debt − Cash")
-                with _va4d:
-                    st.metric("EV/Revenue",  fmt(_evrev3))
-                    _upside_tgt = ((float(_at3)/cp - 1)*100) if _at3 and cp else None
-                    _at_str = f"${fmt(_at3)}" if _at3 else "N/A"
-                    _at_delta = f"{_upside_tgt:+.1f}% upside" if _upside_tgt else ""
-                    st.metric("1Y Analyst Target", _at_str, _at_delta)
+                st.table(_kv([
+                    ("P/E (TTM)",  fmt(info.get("trailingPE"))),
+                    ("P/E (Fwd)",  fmt(info.get("forwardPE"))),
+                    ("PEG Ratio",  fmt(info.get("pegRatio"))),
+                    ("P/S",        fmt(info.get("priceToSalesTrailing12Months"))),
+                    ("P/B",        fmt(info.get("priceToBook"))),
+                    ("EV/EBITDA",  fmt(info.get("enterpriseToEbitda"))),
+                    ("EV/Revenue", fmt(info.get("enterpriseToRevenue"))),
+                    ("1Y Target",  fmt(info.get("targetMeanPrice"))),
+                ]))
 
             with t5:
                 st.markdown("### RSI Oversold + 200 SMA Basic Backtest")
