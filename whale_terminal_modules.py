@@ -11,6 +11,22 @@ try:
     _YF_AVAILABLE = True
 except ImportError:
     _YF_AVAILABLE = False
+
+# ── yahooquery — richer fundamentals, analyst estimates ──────────────────────
+try:
+    from yahooquery import Ticker as YQTicker
+    _YQ_AVAILABLE = True
+except ImportError:
+    _YQ_AVAILABLE = False
+    YQTicker = None  # type: ignore
+
+# ── yahoo_fin — lightweight fallback ─────────────────────────────────────────
+try:
+    import yahoo_fin.stock_info as _yf_fin
+    _YFIN_AVAILABLE = True
+except ImportError:
+    _YFIN_AVAILABLE = False
+    _yf_fin = None  # type: ignore
 import numpy as np
 import pandas as pd
 import streamlit as st
