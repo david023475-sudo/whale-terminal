@@ -16,6 +16,26 @@ try:
     _YF_AVAILABLE = True
 except ImportError:
     _YF_AVAILABLE = False
+
+# ── yahooquery — richer fundamentals, analyst estimates, balance sheet ────────
+# Primary source for all financial ratios, EV, analyst EPS estimates.
+# Install: pip install yahooquery
+try:
+    from yahooquery import Ticker as YQTicker
+    _YQ_AVAILABLE = True
+except ImportError:
+    _YQ_AVAILABLE = False
+    YQTicker = None  # type: ignore
+
+# ── yahoo_fin — lightweight last-resort fallback for key stats ────────────────
+# Install: pip install yahoo_fin requests_html
+try:
+    import yahoo_fin.stock_info as _yf_fin
+    _YFIN_AVAILABLE = True
+except ImportError:
+    _YFIN_AVAILABLE = False
+    _yf_fin = None  # type: ignore
+
 from langchain_groq import ChatGroq
 
 from whale_terminal_modules import (
@@ -411,7 +431,13 @@ with st.sidebar:
     )
 
 # =============================================================================
-# SHARED DATA HELPERS — FMP primary, yfinance automatic fallback
+# SHARED DATA HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+# Source architecture:
+#   OHLCV history   → yfinance primary (FMP fallback kept for intraday)
+#   Fundamentals    → yahooquery PRIMARY → yfinance FALLBACK → yahoo_fin LAST RESORT
+#   Forward P/E     → yfinance earnings_estimate "+1y" avg  (NOT info["forwardEps"])
+#   Caching         → @st.cache_data(ttl=3600) on every network call
 # =============================================================================
 RANGE_MAP = {
     "1D":{"period":"1d","interval":"5m"},  "5D":{"period":"5d","interval":"15m"},
@@ -419,9 +445,8 @@ RANGE_MAP = {
     "6M":{"period":"6mo","interval":"1d"}, "1Y":{"period":"1y","interval":"1d"},
     "2Y":{"period":"2y","interval":"1wk"}, "5Y":{"period":"5y","interval":"1wk"},
 }
-# Sentinel returned by _fmp_get when FMP actively blocks the request (403 or
-# "Error Message"). Callers test `result is _FMP_BLOCKED` to trigger the yf
-# fallback. None means a genuine empty/missing response.
+
+# ── FMP sentinel ──────────────────────────────────────────────────────────────
 class _Blocked:
     """Singleton sentinel: FMP returned a plan/legacy block, not real data."""
     _inst = None
@@ -433,62 +458,38 @@ _FMP_BLOCKED = _Blocked()
 
 FMP_BASE_URL = "https://financialmodelingprep.com/api/v3"
 
-def _fmp_get(path: str, params: dict | None = None,
-             _ui_errors: bool = False):
+def _fmp_get(path: str, params: dict | None = None, _ui_errors: bool = False):
     """
-    Central FMP v3 request helper. Returns one of three things:
-      - Parsed data (list or dict)   on success
-      - _FMP_BLOCKED sentinel        when FMP returns 403 or an Error Message
-                                     (plan restriction / legacy endpoint block)
-      - None                         on empty response, timeout, or network error
-
-    Callers check `result is _FMP_BLOCKED` to trigger the yfinance fallback.
-    Only genuine data problems (wrong ticker, delisted) return None.
-    No st.error banners are shown for _FMP_BLOCKED — the fallback is silent.
+    Central FMP v3 request helper.
+      - Returns parsed data (list/dict) on success.
+      - Returns _FMP_BLOCKED sentinel on 403 / Error Message (plan restriction).
+      - Returns None on empty response, timeout, or network error.
     """
     if not FMP_API_KEY:
-        print("[FMP] FMP_API_KEY is not set")
-        return _FMP_BLOCKED          # no key → treat as blocked, use yf
-
+        return _FMP_BLOCKED
     full_url = f"{FMP_BASE_URL}{path}"
     try:
         p = {"apikey": FMP_API_KEY}
         if params:
             p.update(params)
         r = requests.get(full_url, params=p, timeout=10)
-
-        # 403 = plan restriction → trigger yf fallback silently
         if r.status_code == 403:
             print(f"[FMP 403] {path} — switching to Yahoo Finance fallback")
             return _FMP_BLOCKED
-
         r.raise_for_status()
         data = r.json()
-
-        # FMP returns plan/legacy blocks as HTTP 200 with an error dict
         if isinstance(data, dict) and "Error Message" in data:
-            msg = data["Error Message"]
-            print(f"[FMP blocked] {path}: {msg[:140]}")
+            print(f"[FMP blocked] {path}: {data['Error Message'][:140]}")
             return _FMP_BLOCKED
-
-        # Genuinely empty response — wrong ticker, delisted, etc.
         if data is None or (isinstance(data, (list, dict)) and len(data) == 0):
-            print(f"[FMP empty] {path}")
             if _ui_errors:
-                st.warning(
-                    f"No data found for this ticker. "
-                    "Please verify the symbol is correct and listed on a major exchange."
-                )
+                st.warning("No data found for this ticker. Please verify the symbol is correct.")
             return None
-
         return data
-
     except requests.exceptions.HTTPError as exc:
-        code = exc.response.status_code
-        if code == 403:
-            print(f"[FMP 403] {path} — switching to Yahoo Finance fallback")
+        if exc.response.status_code == 403:
             return _FMP_BLOCKED
-        print(f"[FMP HTTP {code}] {path}: {exc}")
+        print(f"[FMP HTTP {exc.response.status_code}] {path}: {exc}")
         return None
     except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
         print(f"[FMP network error] {path}: {exc}")
@@ -497,15 +498,337 @@ def _fmp_get(path: str, params: dict | None = None,
         print(f"[FMP error] {path}: {exc}")
         return None
 
-# ─── yfinance normaliser ──────────────────────────────────────────────────────
+# ── Shared float helper ───────────────────────────────────────────────────────
+def _sf(v) -> float | None:
+    """Safe float cast; returns None on failure or NaN."""
+    try:
+        f = float(v)
+        return None if (f != f) else f   # NaN check
+    except (TypeError, ValueError):
+        return None
+
+# =============================================================================
+# HYBRID FUNDAMENTALS ENGINE
+# Three cached fetchers; _merge_dicts combines them with first-non-None wins.
+# =============================================================================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _yq_fundamentals(ticker: str) -> dict:
+    """
+    PRIMARY fundamentals source — yahooquery.
+    Fetches financialData, defaultKeyStatistics, summaryDetail, assetProfile,
+    price, and earnings_trend (for analyst EPS estimates).
+    Returns {} if yahooquery is unavailable or raises.
+    """
+    if not _YQ_AVAILABLE:
+        return {}
+    try:
+        t  = YQTicker(ticker)
+
+        # One network round-trip each — yahooquery batches these internally
+        fd = (t.financial_data  or {}).get(ticker) or {}
+        ks = (t.default_key_statistics or {}).get(ticker) or {}
+        sd = (t.summary_detail   or {}).get(ticker) or {}
+        ap = (t.asset_profile    or {}).get(ticker) or {}
+        pr = (t.price            or {}).get(ticker) or {}
+
+        def _g(d, *keys):
+            for k in keys:
+                v = _sf(d.get(k))
+                if v is not None:
+                    return v
+            return None
+
+        live_price = _g(pr, "regularMarketPrice") or _g(fd, "currentPrice")
+        mkt_cap    = _g(pr, "marketCap")
+        total_debt = _g(fd, "totalDebt")
+        total_cash = _g(fd, "totalCash")
+        ebitda     = _g(fd, "ebitda")
+        revenue    = _g(fd, "totalRevenue")
+
+        # EV computed explicitly — more accurate than stale key-metrics value
+        ev = None
+        if mkt_cap is not None:
+            ev = mkt_cap + (total_debt or 0) - (total_cash or 0)
+        ev_ebitda  = (ev / ebitda  if ev and ebitda  and ebitda  != 0 else None)
+        ev_revenue = (ev / revenue if ev and revenue and revenue != 0 else None)
+
+        # ── Forward EPS & P/E from earnings_trend "+1y" ───────────────────────
+        # Yahoo Finance definition: Forward P/E = price / next-fiscal-year analyst EPS.
+        # yahooquery exposes this via earnings_trend[period="+1y"].earningsEstimate.avg
+        fwd_eps = None
+        fwd_pe  = None
+        peg     = None
+        try:
+            trend_raw = t.earnings_trend
+            # yahooquery returns {ticker: {trend: [...]}} or DataFrame depending on version
+            if isinstance(trend_raw, dict):
+                rows = (trend_raw.get(ticker) or {}).get("trend") or []
+            else:
+                rows = []
+            for row in rows:
+                period = str(row.get("period", "")).strip()
+                if period == "+1y":
+                    fwd_eps = _sf((row.get("earningsEstimate") or {}).get("avg"))
+                    break
+            # PEG: fwdPE / 5-yr growth rate
+            for row in rows:
+                if str(row.get("period", "")).strip() == "+5y":
+                    gr = _sf(row.get("growth"))
+                    if gr and gr > 0:
+                        gr_pct = gr * 100 if abs(gr) <= 1 else gr
+                        if fwd_eps and fwd_eps > 0 and live_price and gr_pct > 0:
+                            peg = (live_price / fwd_eps) / gr_pct
+                    break
+        except Exception as _e:
+            print(f"[yq earnings_trend] {ticker}: {_e}")
+
+        if fwd_eps is not None and fwd_eps > 0 and live_price:
+            fwd_pe = live_price / fwd_eps
+
+        return {
+            "symbol":   ticker.upper(),
+            "longName": pr.get("longName") or pr.get("shortName") or "",
+            "sector":   ap.get("sector", ""),
+            "industry": ap.get("industry", ""),
+            "longBusinessSummary": ap.get("longBusinessDescription", ""),
+            "website":  ap.get("website", ""),
+            "country":  ap.get("country", ""),
+            "fullTimeEmployees": _sf(ap.get("fullTimeEmployees")),
+            "currentPrice":  live_price,
+            "previousClose": _g(pr, "regularMarketPreviousClose"),
+            "open":          _g(pr, "regularMarketOpen"),
+            "dayHigh":       _g(pr, "regularMarketDayHigh"),
+            "dayLow":        _g(pr, "regularMarketDayLow"),
+            "volume":        _g(pr, "regularMarketVolume"),
+            "marketCap":     mkt_cap,
+            "beta":          _g(sd, "beta"),
+            "fiftyTwoWeekHigh": _g(sd, "fiftyTwoWeekHigh"),
+            "fiftyTwoWeekLow":  _g(sd, "fiftyTwoWeekLow"),
+            # Valuation
+            "trailingPE":   _g(sd, "trailingPE"),
+            "forwardPE":    fwd_pe,          # price ÷ +1y analyst EPS
+            "pegRatio":     peg,
+            "priceToSalesTrailing12Months": _g(sd, "priceToSalesTrailing12Months"),
+            "priceToBook":  _g(ks, "priceToBook"),
+            "enterpriseToEbitda":  ev_ebitda,
+            "enterpriseToRevenue": ev_revenue,
+            "enterpriseValue":     ev,
+            # EPS
+            "trailingEps":  _g(ks, "trailingEps"),
+            "forwardEps":   fwd_eps,         # +1y analyst consensus
+            # Analyst target
+            "targetMeanPrice": _g(fd, "targetMeanPrice"),
+            # Profitability
+            "profitMargins":    _g(fd, "profitMargins"),
+            "operatingMargins": _g(fd, "operatingMargins"),
+            "grossMargins":     _g(fd, "grossMargins"),
+            "returnOnEquity":   _g(fd, "returnOnEquity"),
+            "returnOnAssets":   _g(fd, "returnOnAssets"),
+            # Balance sheet
+            "totalDebt":    total_debt,
+            "totalCash":    total_cash,
+            "debtToEquity": _g(fd, "debtToEquity"),
+            "quickRatio":   _g(fd, "quickRatio"),
+            "currentRatio": _g(fd, "currentRatio"),
+            "bookValue":    _g(ks, "bookValue"),
+            # Cash flows
+            "freeCashflow":      _g(fd, "freeCashflow"),
+            "operatingCashflow": _g(fd, "operatingCashflow"),
+            # Income
+            "totalRevenue":      revenue,
+            "ebitda":            ebitda,
+            "netIncomeToCommon": _g(ks, "netIncomeToCommon"),
+            # Growth
+            "revenueGrowth":          _g(fd, "revenueGrowth"),
+            "earningsGrowth":         _g(fd, "earningsGrowth"),
+            "quarterlyRevenueGrowth": _g(fd, "revenueGrowth"),
+            "revenuePerShare":        _g(fd, "revenuePerShare"),
+            "sharesOutstanding":      _g(ks, "sharesOutstanding"),
+            "_source": "yahooquery",
+        }
+    except Exception as exc:
+        print(f"[yq fundamentals error] {ticker}: {exc}")
+        return {}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _yf_fundamentals(ticker: str) -> dict:
+    """
+    SECONDARY fundamentals source — yfinance.
+    ─────────────────────────────────────────────────────────────────────────
+    CRITICAL: Forward EPS uses ticker.earnings_estimate.loc["+1y"]["avg"]
+    — NOT info["forwardEps"], which is unreliable and often represents the
+    wrong forecast year (e.g. Tesla: info["forwardEps"] ≈ 2.81 → P/E ≈ 145,
+    but Yahoo Finance uses +1y avg ≈ 2.0 → P/E ≈ 200).
+    ─────────────────────────────────────────────────────────────────────────
+    Returns {} on failure.
+    """
+    if not _YF_AVAILABLE:
+        return {}
+    try:
+        t    = yf.Ticker(ticker)
+        info = t.info or {}
+        if not info:
+            return {}
+
+        price      = _sf(info.get("currentPrice") or info.get("regularMarketPrice"))
+        mkt_cap    = _sf(info.get("marketCap"))
+        total_debt = _sf(info.get("totalDebt"))
+        total_cash = _sf(info.get("totalCash"))
+        ebitda     = _sf(info.get("ebitda"))
+        revenue    = _sf(info.get("totalRevenue"))
+
+        # EV explicitly computed (marketCap + debt − cash)
+        ev = None
+        if mkt_cap is not None:
+            ev = mkt_cap + (total_debt or 0) - (total_cash or 0)
+        ev_ebitda  = (ev / ebitda  if ev and ebitda  and ebitda  != 0 else None)
+        ev_revenue = (ev / revenue if ev and revenue and revenue != 0 else None)
+
+        # ── Forward EPS: use earnings_estimate "+1y" — correct Yahoo Finance method
+        # Do NOT use info["forwardEps"] — it frequently contains the wrong year.
+        fwd_eps = None
+        fwd_pe  = None
+        try:
+            est = t.earnings_estimate
+            if est is not None and not getattr(est, "empty", True):
+                if "+1y" in est.index:
+                    fwd_eps = _sf(est.loc["+1y"].get("avg"))
+        except Exception as _ee:
+            print(f"[yf earnings_estimate] {ticker}: {_ee}")
+
+        if fwd_eps is not None and fwd_eps > 0 and price:
+            fwd_pe = price / fwd_eps
+
+        return {
+            "symbol":   info.get("symbol") or ticker.upper(),
+            "longName": info.get("longName") or info.get("shortName") or "",
+            "sector":   info.get("sector", ""),
+            "industry": info.get("industry", ""),
+            "longBusinessSummary": info.get("longBusinessSummary", ""),
+            "website":  info.get("website", ""),
+            "country":  info.get("country", ""),
+            "fullTimeEmployees": _sf(info.get("fullTimeEmployees")),
+            "currentPrice":  price,
+            "previousClose": _sf(info.get("previousClose") or info.get("regularMarketPreviousClose")),
+            "open":          _sf(info.get("open") or info.get("regularMarketOpen")),
+            "dayHigh":       _sf(info.get("dayHigh") or info.get("regularMarketDayHigh")),
+            "dayLow":        _sf(info.get("dayLow")  or info.get("regularMarketDayLow")),
+            "volume":        _sf(info.get("volume")  or info.get("regularMarketVolume")),
+            "marketCap":     mkt_cap,
+            "beta":          _sf(info.get("beta")),
+            "fiftyTwoWeekHigh": _sf(info.get("fiftyTwoWeekHigh")),
+            "fiftyTwoWeekLow":  _sf(info.get("fiftyTwoWeekLow")),
+            # Valuation — forwardPE derived from +1y analyst consensus
+            "trailingPE":   _sf(info.get("trailingPE")),
+            "forwardPE":    fwd_pe,
+            "pegRatio":     _sf(info.get("pegRatio")),
+            "priceToSalesTrailing12Months": _sf(info.get("priceToSalesTrailing12Months")),
+            "priceToBook":  _sf(info.get("priceToBook")),
+            "enterpriseToEbitda":  ev_ebitda,
+            "enterpriseToRevenue": ev_revenue,
+            "enterpriseValue":     ev,
+            # EPS — trailingEps from info is fine; forwardEps is the corrected +1y value
+            "trailingEps":  _sf(info.get("trailingEps")),
+            "forwardEps":   fwd_eps,
+            "targetMeanPrice": _sf(info.get("targetMeanPrice")),
+            "profitMargins":    _sf(info.get("profitMargins")),
+            "operatingMargins": _sf(info.get("operatingMargins")),
+            "grossMargins":     _sf(info.get("grossMargins")),
+            "returnOnEquity":   _sf(info.get("returnOnEquity")),
+            "returnOnAssets":   _sf(info.get("returnOnAssets")),
+            "totalDebt":    total_debt,
+            "totalCash":    total_cash,
+            "debtToEquity": _sf(info.get("debtToEquity")),
+            "quickRatio":   _sf(info.get("quickRatio")),
+            "currentRatio": _sf(info.get("currentRatio")),
+            "bookValue":    _sf(info.get("bookValue")),
+            "freeCashflow":      _sf(info.get("freeCashflow")),
+            "operatingCashflow": _sf(info.get("operatingCashflow")),
+            "totalRevenue":    revenue,
+            "ebitda":          ebitda,
+            "netIncomeToCommon": _sf(info.get("netIncomeToCommon")),
+            "revenuePerShare":   _sf(info.get("revenuePerShare")),
+            "revenueGrowth":     _sf(info.get("revenueGrowth")),
+            "earningsGrowth":    _sf(info.get("earningsGrowth")),
+            "quarterlyRevenueGrowth": _sf(info.get("revenueGrowth")),
+            "sharesOutstanding": _sf(info.get("sharesOutstanding")),
+            "_source": "Yahoo Finance",
+        }
+    except Exception as exc:
+        print(f"[yf fundamentals error] {ticker}: {exc}")
+        return {}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _yfin_fundamentals(ticker: str) -> dict:
+    """
+    LAST-RESORT fundamentals source — yahoo_fin.
+    Returns a sparse dict with only the fields yahoo_fin provides.
+    Returns {} if yahoo_fin is unavailable or fails.
+    """
+    if not _YFIN_AVAILABLE:
+        return {}
+    try:
+        stats = _yf_fin.get_stats_valuation(ticker)
+        quote = _yf_fin.get_quote_table(ticker)
+
+        def _gs(label: str) -> float | None:
+            try:
+                row = stats[stats.iloc[:, 0].str.contains(label, case=False, na=False)]
+                return _sf(row.iloc[0, 1]) if not row.empty else None
+            except Exception:
+                return None
+
+        def _gq(key: str) -> float | None:
+            try: return _sf(quote.get(key))
+            except: return None
+
+        return {
+            "currentPrice":  _gq("Quote Price"),
+            "trailingPE":    _gs("Trailing P/E"),
+            "priceToBook":   _gs("Price/Book"),
+            "priceToSalesTrailing12Months": _gs("Price/Sales"),
+            "enterpriseToEbitda": _gs("Enterprise Value/EBITDA"),
+            "enterpriseToRevenue": _gs("Enterprise Value/Revenue"),
+            "pegRatio":      _gs("PEG Ratio"),
+            "_source": "yahoo_fin",
+        }
+    except Exception as exc:
+        print(f"[yahoo_fin fundamentals error] {ticker}: {exc}")
+        return {}
+
+
+def _merge_dicts(*dicts: dict) -> dict:
+    """
+    Merge fundamentals dicts left-to-right: first non-None value wins.
+    yahooquery → yfinance → yahoo_fin → FMP profile extras.
+    This means the best/most-reliable source for each field always prevails.
+    """
+    all_keys: set = set()
+    for d in dicts:
+        all_keys.update(d.keys())
+    result: dict = {}
+    for key in all_keys:
+        for d in dicts:
+            val = d.get(key)
+            if val is not None:
+                result[key] = val
+                break
+        else:
+            result[key] = None
+    return result
+
+
+# ─── yfinance normaliser (used only when FMP profile is fully blocked) ────────
 def _yf_info_to_dict(info: dict) -> dict:
     """
-    Convert a raw yfinance .info dict to the same key schema used by
-    get_stock_info so the rest of the UI never knows the source changed.
+    Full yfinance .info → standard schema normaliser.
+    Used as emergency fallback when FMP profile call is blocked.
+    Forward P/E here falls back to info["forwardPE"] since we don't have
+    a separate earnings_estimate call in this emergency path.
     """
-    def _f(v):
-        try: return float(v) if v is not None else None
-        except: return None
     return {
         "symbol":   info.get("symbol"),
         "longName": info.get("longName") or info.get("shortName"),
@@ -514,85 +837,89 @@ def _yf_info_to_dict(info: dict) -> dict:
         "longBusinessSummary": info.get("longBusinessSummary", ""),
         "website":  info.get("website", ""),
         "country":  info.get("country", ""),
-        "fullTimeEmployees": _f(info.get("fullTimeEmployees")),
-        "currentPrice":  _f(info.get("currentPrice") or info.get("regularMarketPrice")),
-        "previousClose": _f(info.get("previousClose") or info.get("regularMarketPreviousClose")),
-        "open":          _f(info.get("open") or info.get("regularMarketOpen")),
-        "dayHigh":       _f(info.get("dayHigh") or info.get("regularMarketDayHigh")),
-        "dayLow":        _f(info.get("dayLow")  or info.get("regularMarketDayLow")),
-        "volume":        _f(info.get("volume")  or info.get("regularMarketVolume")),
-        "marketCap":     _f(info.get("marketCap")),
-        "beta":          _f(info.get("beta")),
-        "fiftyTwoWeekHigh": _f(info.get("fiftyTwoWeekHigh")),
-        "fiftyTwoWeekLow":  _f(info.get("fiftyTwoWeekLow")),
-        "trailingPE":    _f(info.get("trailingPE")),
-        "forwardPE":     _f(info.get("forwardPE")),
-        "pegRatio":      _f(info.get("pegRatio")),
-        "priceToSalesTrailing12Months": _f(info.get("priceToSalesTrailing12Months")),
-        "priceToBook":   _f(info.get("priceToBook")),
-        "enterpriseToEbitda":  _f(info.get("enterpriseToEbitda")),
-        "enterpriseToRevenue": _f(info.get("enterpriseToRevenue")),
-        "trailingEps":     _f(info.get("trailingEps")),
-        "forwardEps":      _f(info.get("forwardEps")),
-        "targetMeanPrice": _f(info.get("targetMeanPrice")),
-        "profitMargins":    _f(info.get("profitMargins")),
-        "operatingMargins": _f(info.get("operatingMargins")),
-        "grossMargins":     _f(info.get("grossMargins")),
-        "returnOnEquity":   _f(info.get("returnOnEquity")),
-        "returnOnAssets":   _f(info.get("returnOnAssets")),
-        "totalDebt":    _f(info.get("totalDebt")),
-        "totalCash":    _f(info.get("totalCash")),
-        "debtToEquity": _f(info.get("debtToEquity")),
-        "quickRatio":   _f(info.get("quickRatio")),
-        "currentRatio": _f(info.get("currentRatio")),
-        "bookValue":    _f(info.get("bookValue")),
-        "freeCashflow":      _f(info.get("freeCashflow")),
-        "operatingCashflow": _f(info.get("operatingCashflow")),
-        "totalRevenue":    _f(info.get("totalRevenue")),
-        "ebitda":          _f(info.get("ebitda")),
-        "netIncomeToCommon": _f(info.get("netIncomeToCommon")),
-        "revenuePerShare": _f(info.get("revenuePerShare")),
-        "revenueGrowth":   _f(info.get("revenueGrowth")),
-        "earningsGrowth":  _f(info.get("earningsGrowth")),
-        "quarterlyRevenueGrowth": _f(info.get("revenueGrowth")),
-        "sharesOutstanding": _f(info.get("sharesOutstanding")),
-        "_source": "Yahoo Finance",
+        "fullTimeEmployees": _sf(info.get("fullTimeEmployees")),
+        "currentPrice":  _sf(info.get("currentPrice") or info.get("regularMarketPrice")),
+        "previousClose": _sf(info.get("previousClose") or info.get("regularMarketPreviousClose")),
+        "open":          _sf(info.get("open") or info.get("regularMarketOpen")),
+        "dayHigh":       _sf(info.get("dayHigh") or info.get("regularMarketDayHigh")),
+        "dayLow":        _sf(info.get("dayLow")  or info.get("regularMarketDayLow")),
+        "volume":        _sf(info.get("volume")  or info.get("regularMarketVolume")),
+        "marketCap":     _sf(info.get("marketCap")),
+        "beta":          _sf(info.get("beta")),
+        "fiftyTwoWeekHigh": _sf(info.get("fiftyTwoWeekHigh")),
+        "fiftyTwoWeekLow":  _sf(info.get("fiftyTwoWeekLow")),
+        "trailingPE":    _sf(info.get("trailingPE")),
+        "forwardPE":     _sf(info.get("forwardPE")),
+        "pegRatio":      _sf(info.get("pegRatio")),
+        "priceToSalesTrailing12Months": _sf(info.get("priceToSalesTrailing12Months")),
+        "priceToBook":   _sf(info.get("priceToBook")),
+        "enterpriseToEbitda":  _sf(info.get("enterpriseToEbitda")),
+        "enterpriseToRevenue": _sf(info.get("enterpriseToRevenue")),
+        "trailingEps":     _sf(info.get("trailingEps")),
+        "forwardEps":      _sf(info.get("forwardEps")),
+        "targetMeanPrice": _sf(info.get("targetMeanPrice")),
+        "profitMargins":    _sf(info.get("profitMargins")),
+        "operatingMargins": _sf(info.get("operatingMargins")),
+        "grossMargins":     _sf(info.get("grossMargins")),
+        "returnOnEquity":   _sf(info.get("returnOnEquity")),
+        "returnOnAssets":   _sf(info.get("returnOnAssets")),
+        "totalDebt":    _sf(info.get("totalDebt")),
+        "totalCash":    _sf(info.get("totalCash")),
+        "debtToEquity": _sf(info.get("debtToEquity")),
+        "quickRatio":   _sf(info.get("quickRatio")),
+        "currentRatio": _sf(info.get("currentRatio")),
+        "bookValue":    _sf(info.get("bookValue")),
+        "freeCashflow":      _sf(info.get("freeCashflow")),
+        "operatingCashflow": _sf(info.get("operatingCashflow")),
+        "totalRevenue":    _sf(info.get("totalRevenue")),
+        "ebitda":          _sf(info.get("ebitda")),
+        "netIncomeToCommon": _sf(info.get("netIncomeToCommon")),
+        "revenuePerShare": _sf(info.get("revenuePerShare")),
+        "revenueGrowth":   _sf(info.get("revenueGrowth")),
+        "earningsGrowth":  _sf(info.get("earningsGrowth")),
+        "quarterlyRevenueGrowth": _sf(info.get("revenueGrowth")),
+        "sharesOutstanding": _sf(info.get("sharesOutstanding")),
+        "_source": "Yahoo Finance (emergency fallback)",
     }
 
-# ── Stock info ────────────────────────────────────────────────────────────────
+
+# ── Stock info — hybrid multi-source engine ────────────────────────────────────
 @st.cache_data(ttl=900, show_spinner=False)
 def get_stock_info(ticker: str) -> dict:
     """
-    Fetch full company fundamentals. FMP is primary; yfinance is the automatic
-    silent fallback if FMP returns a 403 or plan/legacy error.
+    Fetch full company fundamentals using the hybrid multi-source engine.
 
-    FMP endpoints (non-legacy, available to all account tiers):
-      /profile, /quote, /ratios, /key-metrics, /income-statement,
-      /balance-sheet-statement
+    Source priority for fundamentals:
+      1. yahooquery  — primary (richer, reliable analyst EPS estimates)
+      2. yfinance    — secondary (broad coverage, earnings_estimate +1y for fwd P/E)
+      3. yahoo_fin   — tertiary sparse fallback (basic valuation ratios only)
 
-    Yahoo Finance fallback:
-      yf.Ticker(ticker).info — provides the same key schema via _yf_info_to_dict
+    Forward P/E calculation (both yq and yf paths):
+      price / earnings_estimate "+1y" avg  — matches Yahoo Finance exactly.
+      info["forwardEps"] is intentionally NOT used (wrong year bias).
+
+    FMP is used only for:
+      - Gating call to confirm ticker validity (/profile)
+      - Real-time price / volume / day range (/quote) — overrides stale yq/yf price
+      - OHLCV history (get_stock_history)
     """
-    def _f(v):
-        try: return float(v) if v is not None else None
-        except: return None
-    _r = _f  # /ratios returns 0-1 decimals already
+    ticker = ticker.upper().strip()
 
-    # ── 1. FMP profile — the gating call ─────────────────────────────────────
+    # ── Step 1: FMP profile gating call ──────────────────────────────────────
     profile_data = _fmp_get(f"/profile/{ticker}", _ui_errors=True)
+
     if profile_data is _FMP_BLOCKED:
-        # FMP blocked → fall silently to Yahoo Finance
-        print(f"[Fallback] get_stock_info({ticker}) → Yahoo Finance")
-        st.info(f"ℹ️ Using backup data source for {ticker}", icon="ℹ️")
-        try:
-            info = yf.Ticker(ticker).info
-            if not info or not info.get("symbol"):
-                st.error(f"❌ Could not fetch data for **{ticker}** from either FMP or Yahoo Finance.")
-                return {}
-            return _yf_info_to_dict(info)
-        except Exception as exc:
-            st.error(f"❌ Yahoo Finance fallback also failed for **{ticker}**: {exc}")
+        # FMP fully blocked — use full hybrid stack
+        print(f"[Hybrid] {ticker}: FMP blocked, using yq → yf → yfin")
+        st.info(f"ℹ️ Using multi-source data engine for {ticker}", icon="ℹ️")
+        yq   = _yq_fundamentals(ticker)
+        yf_  = _yf_fundamentals(ticker)
+        yfin = _yfin_fundamentals(ticker)
+        merged = _merge_dicts(yq, yf_, yfin)
+        if not merged.get("currentPrice"):
+            st.error(f"❌ Could not fetch data for **{ticker}** from any source.")
             return {}
+        return merged
 
     if not profile_data or not isinstance(profile_data, list):
         st.error(
@@ -602,50 +929,16 @@ def get_stock_info(ticker: str) -> dict:
         return {}
     p = profile_data[0]
 
-    # ── 2. Real-time quote ────────────────────────────────────────────────────
+    # ── Step 2: FMP real-time quote (freshest available price/volume) ─────────
     qt: dict = {}
     qt_data = _fmp_get(f"/quote/{ticker}")
     if qt_data and qt_data is not _FMP_BLOCKED and isinstance(qt_data, list):
         qt = qt_data[0]
 
-    # ── 3. Financial ratios (non-legacy) ──────────────────────────────────────
-    ra: dict = {}
-    ra_data = _fmp_get(f"/ratios/{ticker}", {"period": "annual", "limit": 1})
-    if ra_data and ra_data is not _FMP_BLOCKED and isinstance(ra_data, list):
-        ra = ra_data[0]
-
-    # ── 4. Key metrics (non-legacy) ───────────────────────────────────────────
-    km: dict = {}
-    km_data = _fmp_get(f"/key-metrics/{ticker}", {"period": "annual", "limit": 1})
-    if km_data and km_data is not _FMP_BLOCKED and isinstance(km_data, list):
-        km = km_data[0]
-
-    # ── 5. Income statement (two rows for YoY growth) ─────────────────────────
-    inc: dict = {}
-    _rev_growth = _ni_growth = None
-    inc_data = _fmp_get(f"/income-statement/{ticker}", {"period": "annual", "limit": 2})
-    if inc_data and inc_data is not _FMP_BLOCKED and isinstance(inc_data, list):
-        inc = inc_data[0]
-        if len(inc_data) >= 2:
-            rev0 = float(inc_data[0].get("revenue") or 0)
-            rev1 = float(inc_data[1].get("revenue") or 0)
-            ni0  = float(inc_data[0].get("netIncome") or 0)
-            ni1  = float(inc_data[1].get("netIncome") or 0)
-            _rev_growth = (rev0 - rev1) / abs(rev1) if rev1 else None
-            _ni_growth  = (ni0  - ni1)  / abs(ni1)  if ni1  else None
-
-    # ── 6. Balance sheet ──────────────────────────────────────────────────────
-    bs: dict = {}
-    bs_data = _fmp_get(f"/balance-sheet-statement/{ticker}", {"period": "annual", "limit": 1})
-    if bs_data and bs_data is not _FMP_BLOCKED and isinstance(bs_data, list):
-        bs = bs_data[0]
-
-    # Live price: quote fresher than profile
-    live_price = _f(qt.get("price")) or _f(p.get("price"))
-    prev_close = _f(qt.get("previousClose")) or live_price
-
-    wk52_high = _f(qt.get("yearHigh"))
-    wk52_low  = _f(qt.get("yearLow"))
+    live_price = _sf(qt.get("price")) or _sf(p.get("price"))
+    prev_close = _sf(qt.get("previousClose")) or live_price
+    wk52_high  = _sf(qt.get("yearHigh"))
+    wk52_low   = _sf(qt.get("yearLow"))
     if not wk52_high:
         raw_range = p.get("range", "") or ""
         if "-" in raw_range:
@@ -656,102 +949,38 @@ def get_stock_info(ticker: str) -> dict:
             except (ValueError, IndexError):
                 pass
 
-    # ── 7. Analyst EPS estimates — next fiscal year only ─────────────────────
-    # Yahoo Finance Forward P/E = Current Price / NEXT fiscal year EPS estimate.
-    # FMP /analyst-estimates returns annual rows sorted newest-first.
-    # We fetch limit=4 to have enough rows, then pick the FIRST entry whose
-    # fiscal year end date is strictly in the future (i.e. not yet reported).
-    # This guarantees we always use next-year, never the year after.
-    _fwd_eps   = None   # next-fiscal-year analyst EPS consensus
-    _fwd_pe    = None   # Forward P/E derived from it
-    try:
-        _today_str = datetime.now().strftime("%Y-%m-%d")
-        ae_data = _fmp_get(f"/analyst-estimates/{ticker}",
-                           {"period": "annual", "limit": 4})
-        if ae_data and ae_data is not _FMP_BLOCKED and isinstance(ae_data, list):
-            # FMP rows are newest-first; find the first one whose date is future
-            for _row in ae_data:
-                _row_date = str(_row.get("date", "") or "")
-                if _row_date >= _today_str:          # future fiscal-year end
-                    _eps_candidate = _f(_row.get("estimatedEpsAvg")
-                                        or _row.get("estimatedEps"))
-                    if _eps_candidate is not None:   # accept negative too (loss)
-                        _fwd_eps = _eps_candidate
-                        break
-            # Fallback: if every row is past-dated (e.g. recently reported),
-            # take the most-recent row as the best available estimate.
-            if _fwd_eps is None and ae_data:
-                _eps_candidate = _f(ae_data[0].get("estimatedEpsAvg")
-                                    or ae_data[0].get("estimatedEps"))
-                if _eps_candidate is not None:
-                    _fwd_eps = _eps_candidate
+    # ── Step 3: Fundamentals from hybrid engine ───────────────────────────────
+    # yahooquery wins on all shared fields; yfinance fills gaps; yahoo_fin patches rest
+    yq   = _yq_fundamentals(ticker)
+    yf_  = _yf_fundamentals(ticker)
+    yfin = _yfin_fundamentals(ticker)
+    hyb  = _merge_dicts(yq, yf_, yfin)
 
-        # Forward P/E: only calculate when EPS is a positive number.
-        # A negative or zero forward EPS produces a meaningless ratio.
-        if _fwd_eps is not None and _fwd_eps > 0 and live_price:
-            _fwd_pe = live_price / _fwd_eps
-    except Exception as _ae_exc:
-        print(f"[analyst-estimates] {ticker}: {_ae_exc}")
-        # _fwd_eps and _fwd_pe remain None — UI will show N/A
+    # ── Step 4: Override price/market fields with fresh FMP quote data ────────
+    # FMP /quote is real-time; fundamental sources cache at 3600s
+    if live_price:
+        hyb["currentPrice"]  = live_price
+        hyb["previousClose"] = prev_close
+        hyb["open"]    = _sf(qt.get("open"))    or live_price
+        hyb["dayHigh"] = _sf(qt.get("dayHigh")) or hyb.get("dayHigh") or live_price
+        hyb["dayLow"]  = _sf(qt.get("dayLow"))  or hyb.get("dayLow")  or live_price
+        hyb["volume"]  = _sf(qt.get("volume"))  or hyb.get("volume")
+        hyb["marketCap"] = _sf(qt.get("marketCap")) or hyb.get("marketCap")
 
-    return {
-        "symbol":   p.get("symbol"),
-        "longName": p.get("companyName"),
-        "sector":   p.get("sector"),
-        "industry": p.get("industry"),
-        "longBusinessSummary": p.get("description", ""),
-        "website":  p.get("website", ""),
-        "country":  p.get("country", ""),
-        "fullTimeEmployees": _f(p.get("fullTimeEmployees")),
-        "currentPrice":     live_price,
-        "previousClose":    prev_close,
-        "open":             _f(qt.get("open"))    or live_price,
-        "dayHigh":          _f(qt.get("dayHigh")),
-        "dayLow":           _f(qt.get("dayLow")),
-        "volume":           _f(qt.get("volume"))  or _f(p.get("volAvg")),
-        "marketCap":        _f(qt.get("marketCap")) or _f(p.get("mktCap")),
-        "beta":             _f(p.get("beta")),
-        "fiftyTwoWeekHigh": wk52_high,
-        "fiftyTwoWeekLow":  wk52_low,
-        "trailingPE":  _r(ra.get("priceEarningsRatioTTM") or ra.get("priceEarningsRatio")),
-        # Forward P/E: price / next-fiscal-year analyst consensus EPS
-        # Returns None when no valid estimate is available (UI shows N/A)
-        "forwardPE":   _fwd_pe,
-        "pegRatio":    _r(km.get("pegRatio")),
-        "priceToSalesTrailing12Months": _r(ra.get("priceToSalesRatioTTM") or ra.get("priceToSalesRatio")),
-        "priceToBook": _r(ra.get("priceToBookRatioTTM") or ra.get("priceToBookRatio")),
-        "enterpriseToEbitda":  _r(km.get("enterpriseValueOverEBITDA")),
-        "enterpriseToRevenue": _r(km.get("evToSales")),
-        "trailingEps":     _f(inc.get("epsdiluted") or p.get("eps")),
-        # Forward EPS: next-fiscal-year analyst consensus (None if unavailable)
-        "forwardEps":      _fwd_eps,
-        "targetMeanPrice": _f(p.get("dcf")),
-        "profitMargins":    _r(ra.get("netProfitMarginTTM")       or ra.get("netProfitMargin")),
-        "operatingMargins": _r(ra.get("operatingProfitMarginTTM") or ra.get("operatingProfitMargin")),
-        "grossMargins":     _r(ra.get("grossProfitMarginTTM")     or ra.get("grossProfitMargin")),
-        "returnOnEquity":   _r(ra.get("returnOnEquityTTM")        or ra.get("returnOnEquity")),
-        "returnOnAssets":   _r(ra.get("returnOnAssetsTTM")        or ra.get("returnOnAssets")),
-        "totalDebt":    _f(bs.get("totalDebt")              or p.get("totalDebt")),
-        "totalCash":    _f(bs.get("cashAndCashEquivalents") or p.get("cash")),
-        "debtToEquity": _r(ra.get("debtEquityRatioTTM")     or ra.get("debtEquityRatio")),
-        "quickRatio":   _r(ra.get("quickRatioTTM")          or ra.get("quickRatio")),
-        "currentRatio": _r(ra.get("currentRatioTTM")        or ra.get("currentRatio")),
-        "bookValue":    _f(km.get("bookValuePerShare")),
-        "freeCashflow": (
-            (_f(ra.get("freeCashFlowPerShareTTM") or ra.get("freeCashFlowPerShare")) or 0) *
-            (_f(bs.get("commonStock") or p.get("sharesOutstanding")) or 1)
-        ) if (ra.get("freeCashFlowPerShareTTM") or ra.get("freeCashFlowPerShare")) else None,
-        "operatingCashflow": _f(inc.get("operatingCashFlow")),
-        "totalRevenue":    _f(inc.get("revenue")    or p.get("revenue")),
-        "ebitda":          _f(inc.get("ebitda")),
-        "netIncomeToCommon": _f(inc.get("netIncome")),
-        "revenuePerShare": _f(km.get("revenuePerShare")),
-        "revenueGrowth":   _rev_growth,
-        "earningsGrowth":  _ni_growth,
-        "quarterlyRevenueGrowth": _rev_growth,
-        "sharesOutstanding": _f(bs.get("commonStock") or p.get("sharesOutstanding")),
-        "_source": "FMP-v3",
-    }
+    # ── Step 5: Fill profile-only fields if hybrid missed them ────────────────
+    if not hyb.get("longName"):   hyb["longName"]   = p.get("companyName", "")
+    if not hyb.get("sector"):     hyb["sector"]     = p.get("sector", "")
+    if not hyb.get("industry"):   hyb["industry"]   = p.get("industry", "")
+    if not hyb.get("country"):    hyb["country"]    = p.get("country", "")
+    if not hyb.get("website"):    hyb["website"]    = p.get("website", "")
+    if not hyb.get("beta"):       hyb["beta"]       = _sf(p.get("beta"))
+    hyb["longBusinessSummary"] = (hyb.get("longBusinessSummary")
+                                  or p.get("description", ""))
+    if not hyb.get("fiftyTwoWeekHigh"): hyb["fiftyTwoWeekHigh"] = wk52_high
+    if not hyb.get("fiftyTwoWeekLow"):  hyb["fiftyTwoWeekLow"]  = wk52_low
+
+    hyb["_source"] = f"Hybrid (yq+yf+yfin, FMP quote)"
+    return hyb
 # ── OHLCV history ─────────────────────────────────────────────────────────────
 def _yf_history(ticker: str, period: str, interval: str) -> "pd.DataFrame":
     """Fetch OHLCV from Yahoo Finance and normalise to the same shape as FMP."""
@@ -2057,8 +2286,8 @@ def page_analysis(run_analysis: bool) -> None:
                     showspikes=True,
                     spikemode="across+toaxis",
                     spikesnap="cursor",
-                    spikecolor="rgba(139,148,158,0.45)",
-                    spikethickness=0.5,
+                    spikecolor="#58a6ff",
+                    spikethickness=1,
                     spikedash="solid",
                 ),
             )
@@ -2069,7 +2298,7 @@ def page_analysis(run_analysis: bool) -> None:
                 **_AXIS_CFG,
                 tickprefix="$",
                 side="right",
-                showspikes=True, spikecolor="rgba(139,148,158,0.45)", spikethickness=0.5,
+                showspikes=True, spikecolor="#58a6ff", spikethickness=1,
             )
             # Y-axis: volume panel (row 2)
             fig.update_yaxes(
@@ -2113,8 +2342,8 @@ def page_analysis(run_analysis: bool) -> None:
                     showspikes=True,
                     spikemode="across+toaxis",
                     spikesnap="cursor",
-                    spikecolor="rgba(139,148,158,0.45)",
-                    spikethickness=0.5,
+                    spikecolor="#58a6ff",
+                    spikethickness=1,
                     spikedash="solid",
                 )
 
