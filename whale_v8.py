@@ -25,6 +25,7 @@ from whale_terminal_modules import (
     render_polymarket_tab,
     get_auto_peers, render_peer_group_info,
     _strip_tz, SECTOR_ETF_MAP, SECTOR_COLORS,
+    _FMP_BLOCKED,   # F-20: single source of truth; do NOT redefine in this file
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -237,36 +238,23 @@ input, textarea, select, .stTextInput input { font-size: 16px !important; }
 # ===================== CONFIG — secrets via st.secrets =======================
 # ─────────────────────────────────────────────────────────────────────────────
 # HARDCODED FALLBACKS — edit these if st.secrets is not loading correctly.
-# These are only used when st.secrets and environment variables both return
-# empty strings (e.g. during local dev without a secrets.toml, or if Streamlit
-# Cloud fails to inject secrets). Remove or blank them out for production.
 # ─────────────────────────────────────────────────────────────────────────────
-_FALLBACK_FMP_API_KEY    = "a"
-_FALLBACK_SUPABASE_URL   = "a"
-_FALLBACK_SUPABASE_KEY   = "a"
-_FALLBACK_GROQ_API_KEY   = "a"
-_FALLBACK_NEWS_API_KEY   = "a"
-_FALLBACK_ALPACA_KEY     = ""   # not configured yet
-_FALLBACK_ALPACA_SECRET  = ""   # not configured yet
+# Hardcoded fallback values REMOVED (F-12).
+# The old pattern used "a" as a placeholder which:
+#   (1) gets sent to external APIs on every call, generating auth errors;
+#   (2) trains contributors to treat hardcoded secrets as acceptable.
+# Empty-string defaults mean the feature is cleanly disabled when the real
+# secret is absent.  Set real keys in .streamlit/secrets.toml or env vars.
+# See .env.example for the full list of required keys.
+# ─────────────────────────────────────────────────────────────────────────────
 
-_FALLBACKS: dict[str, str] = {
-    "FMP_API_KEY":    _FALLBACK_FMP_API_KEY,
-    "SUPABASE_URL":   _FALLBACK_SUPABASE_URL,
-    "SUPABASE_ANON_KEY": _FALLBACK_SUPABASE_KEY,
-    "GROQ_API_KEY":   _FALLBACK_GROQ_API_KEY,
-    "NEWS_API_KEY":   _FALLBACK_NEWS_API_KEY,
-    "ALPACA_KEY":     _FALLBACK_ALPACA_KEY,
-    "ALPACA_SECRET":  _FALLBACK_ALPACA_SECRET,
-}
-
-# Helper: st.secrets first, os.environ second, hardcoded fallback third
+# Helper: st.secrets first, os.environ second, empty string (feature disabled)
 def _secret(key: str, default: str = "") -> str:
     """
     Priority:
       1. st.secrets[key]   — Streamlit Cloud / .streamlit/secrets.toml
       2. os.environ[key]   — Docker / local env vars
-      3. _FALLBACKS[key]   — hardcoded values above (last resort)
-      4. default           — empty string (feature degrades gracefully)
+      3. default           — empty string (feature degrades gracefully)
     Never raises; missing secrets disable features without crashing.
     """
     try:
@@ -275,10 +263,7 @@ def _secret(key: str, default: str = "") -> str:
             return v
     except (KeyError, FileNotFoundError, Exception):
         pass
-    env_val = os.environ.get(key, "")
-    if env_val:
-        return env_val
-    return _FALLBACKS.get(key, default)
+    return os.environ.get(key, default)
 
 GROQ_API_KEY  = _secret("GROQ_API_KEY")
 FMP_API_KEY   = _secret("FMP_API_KEY")
@@ -419,17 +404,9 @@ RANGE_MAP = {
     "6M":{"period":"6mo","interval":"1d"}, "1Y":{"period":"1y","interval":"1d"},
     "2Y":{"period":"2y","interval":"1wk"}, "5Y":{"period":"5y","interval":"1wk"},
 }
-# Sentinel returned by _fmp_get when FMP actively blocks the request (403 or
-# "Error Message"). Callers test `result is _FMP_BLOCKED` to trigger the yf
-# fallback. None means a genuine empty/missing response.
-class _Blocked:
-    """Singleton sentinel: FMP returned a plan/legacy block, not real data."""
-    _inst = None
-    def __new__(cls):
-        if cls._inst is None: cls._inst = super().__new__(cls)
-        return cls._inst
-    def __repr__(self): return "<FMP_BLOCKED>"
-_FMP_BLOCKED = _Blocked()
+# _FMP_BLOCKED is imported from whale_terminal_modules — single definition ensures
+# that `result is _FMP_BLOCKED` identity checks work across the module boundary.
+# DO NOT redefine _Blocked or _FMP_BLOCKED here.
 
 FMP_BASE_URL = "https://financialmodelingprep.com/api/v3"
 
@@ -622,23 +599,32 @@ def get_stock_info(ticker: str) -> dict:
 
     # ── 5. Income statement (two rows for YoY growth) ─────────────────────────
     inc: dict = {}
-    _rev_growth = _ni_growth = None
+    _rev_growth = _eps_growth = None
     inc_data = _fmp_get(f"/income-statement/{ticker}", {"period": "annual", "limit": 2})
     if inc_data and inc_data is not _FMP_BLOCKED and isinstance(inc_data, list):
         inc = inc_data[0]
         if len(inc_data) >= 2:
             rev0 = float(inc_data[0].get("revenue") or 0)
             rev1 = float(inc_data[1].get("revenue") or 0)
-            ni0  = float(inc_data[0].get("netIncome") or 0)
-            ni1  = float(inc_data[1].get("netIncome") or 0)
+            # F-04: use diluted EPS growth, not net income growth.
+            # Net income is affected by share buybacks and one-off items;
+            # EPS growth is what drives P/E-based valuation and PEG ratio.
+            eps0 = float(inc_data[0].get("epsdiluted") or 0)
+            eps1 = float(inc_data[1].get("epsdiluted") or 0)
             _rev_growth = (rev0 - rev1) / abs(rev1) if rev1 else None
-            _ni_growth  = (ni0  - ni1)  / abs(ni1)  if ni1  else None
+            _eps_growth = (eps0 - eps1) / abs(eps1) if eps1 else None
 
     # ── 6. Balance sheet ──────────────────────────────────────────────────────
     bs: dict = {}
     bs_data = _fmp_get(f"/balance-sheet-statement/{ticker}", {"period": "annual", "limit": 1})
     if bs_data and bs_data is not _FMP_BLOCKED and isinstance(bs_data, list):
         bs = bs_data[0]
+
+    # ── 7. Cash flow statement (F-05: direct FCF, not per-share reconstruction) ─
+    cf: dict = {}
+    cf_data = _fmp_get(f"/cash-flow-statement/{ticker}", {"period": "annual", "limit": 1})
+    if cf_data and cf_data is not _FMP_BLOCKED and isinstance(cf_data, list):
+        cf = cf_data[0]
 
     # Live price: quote fresher than profile
     live_price = _f(qt.get("price")) or _f(p.get("price"))
@@ -655,6 +641,19 @@ def get_stock_info(ticker: str) -> dict:
                 wk52_high = float(parts[-1])
             except (ValueError, IndexError):
                 pass
+
+    # F-05: FCF fallback order:
+    #   1. /cash-flow-statement freeCashFlow  (direct — most accurate)
+    #   2. fcf_per_share × sharesOutstanding  (only if shares are from profile/key-metrics)
+    #   3. None — never use balance-sheet commonStock as a share count
+    _fcf = _f(cf.get("freeCashFlow"))
+    if _fcf is None:
+        _fcf_ps = _f(ra.get("freeCashFlowPerShareTTM") or ra.get("freeCashFlowPerShare"))
+        _shares = (_f(km.get("weightedAverageSharesOutstanding"))
+                   or _f(p.get("sharesOutstanding")))
+        if _fcf_ps is not None and _shares and _shares > 0:
+            _fcf = _fcf_ps * _shares
+        # else: remains None — do not fabricate from balance-sheet commonStock
 
     return {
         "symbol":   p.get("symbol"),
@@ -676,15 +675,25 @@ def get_stock_info(ticker: str) -> dict:
         "fiftyTwoWeekHigh": wk52_high,
         "fiftyTwoWeekLow":  wk52_low,
         "trailingPE":  _r(ra.get("priceEarningsRatioTTM") or ra.get("priceEarningsRatio")),
-        "forwardPE":   _r(ra.get("priceEarningsRatioTTM") or ra.get("priceEarningsRatio")),
+        # F-01: forwardPE — FMP free tier does not expose true NTM P/E.
+        # Returning None so the UI shows N/A rather than the TTM alias.
+        # The yfinance fallback path (_yf_info_to_dict) correctly reads
+        # info["forwardPE"] which Yahoo derives from next-year EPS estimates.
+        "forwardPE":   None,
         "pegRatio":    _r(km.get("pegRatio")),
         "priceToSalesTrailing12Months": _r(ra.get("priceToSalesRatioTTM") or ra.get("priceToSalesRatio")),
         "priceToBook": _r(ra.get("priceToBookRatioTTM") or ra.get("priceToBookRatio")),
         "enterpriseToEbitda":  _r(km.get("enterpriseValueOverEBITDA")),
         "enterpriseToRevenue": _r(km.get("evToSales")),
         "trailingEps":     _f(inc.get("epsdiluted") or p.get("eps")),
-        "forwardEps":      _f(inc.get("epsdiluted") or p.get("eps")),
-        "targetMeanPrice": _f(p.get("dcf")),
+        # F-02: forwardEps — epsdiluted is the most-recent historical reported EPS,
+        # not a forward estimate. FMP free tier has no analyst EPS estimates endpoint.
+        # Returning None; yfinance fallback reads info["forwardEps"] (true NTM estimate).
+        "forwardEps":      None,
+        # F-03: targetMeanPrice — p.get("dcf") is FMP's own automated DCF model,
+        # NOT Wall Street analyst consensus. These are fundamentally different data
+        # points. Returning None; yfinance reads info["targetMeanPrice"] (true consensus).
+        "targetMeanPrice": None,
         "profitMargins":    _r(ra.get("netProfitMarginTTM")       or ra.get("netProfitMargin")),
         "operatingMargins": _r(ra.get("operatingProfitMarginTTM") or ra.get("operatingProfitMargin")),
         "grossMargins":     _r(ra.get("grossProfitMarginTTM")     or ra.get("grossProfitMargin")),
@@ -696,19 +705,17 @@ def get_stock_info(ticker: str) -> dict:
         "quickRatio":   _r(ra.get("quickRatioTTM")          or ra.get("quickRatio")),
         "currentRatio": _r(ra.get("currentRatioTTM")        or ra.get("currentRatio")),
         "bookValue":    _f(km.get("bookValuePerShare")),
-        "freeCashflow": (
-            (_f(ra.get("freeCashFlowPerShareTTM") or ra.get("freeCashFlowPerShare")) or 0) *
-            (_f(bs.get("commonStock") or p.get("sharesOutstanding")) or 1)
-        ) if (ra.get("freeCashFlowPerShareTTM") or ra.get("freeCashFlowPerShare")) else None,
-        "operatingCashflow": _f(inc.get("operatingCashFlow")),
+        "freeCashflow":      _fcf,   # F-05: from cash flow statement, see fallback logic above
+        "operatingCashflow": _f(cf.get("operatingCashFlow") or inc.get("operatingCashFlow")),
         "totalRevenue":    _f(inc.get("revenue")    or p.get("revenue")),
         "ebitda":          _f(inc.get("ebitda")),
         "netIncomeToCommon": _f(inc.get("netIncome")),
         "revenuePerShare": _f(km.get("revenuePerShare")),
         "revenueGrowth":   _rev_growth,
-        "earningsGrowth":  _ni_growth,
+        # F-04: earningsGrowth now uses diluted EPS YoY, not net income YoY
+        "earningsGrowth":  _eps_growth,
         "quarterlyRevenueGrowth": _rev_growth,
-        "sharesOutstanding": _f(bs.get("commonStock") or p.get("sharesOutstanding")),
+        "sharesOutstanding": _f(p.get("sharesOutstanding") or km.get("weightedAverageSharesOutstanding")),
         "_source": "FMP-v3",
     }
 # ── OHLCV history ─────────────────────────────────────────────────────────────
@@ -1163,12 +1170,13 @@ def calc_fair_value(info, hist, dg=0.20, dw=0.10):
     except: return None
 
 # ── News ──────────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=900, show_spinner=False)   # 15-min cache (was 30-min)
-def get_news_sentiment(ticker: str, company_name: str = "") -> list[dict]:
+@st.cache_data(ttl=900, show_spinner=False)   # 15-min cache — raw article fetch only
+def _fetch_news_raw(ticker: str, company_name: str = "") -> list[dict]:
     """
-    Fetch news + AI sentiment scoring.
-    v8: prioritises last 24-48 hours; flags articles < 12h old as 'breaking'.
-    TTL=15 min so fresh news surfaces quickly.
+    F-11: Fetch raw headlines only — NO LLM calls inside this cached function.
+    Streamlit objects (llm, ChatGroq) are not serialisable by @st.cache_data,
+    so calling llm.invoke() inside a cache decorator will raise or silently
+    fail.  Sentiment scoring is done in get_news_sentiment() which is NOT cached.
     """
     arts: list[dict] = []
     now_utc = datetime.utcnow()
@@ -1176,7 +1184,6 @@ def get_news_sentiment(ticker: str, company_name: str = "") -> list[dict]:
     if NEWS_API_KEY:
         try:
             q = f"{ticker} stock" if not company_name else f"{ticker} OR \"{company_name}\""
-            # Ask for the very latest — sortBy publishedAt, from=48h ago
             from_ts = (now_utc - pd.Timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%S")
             r = requests.get("https://newsapi.org/v2/everything",
                 params={"q": q, "language": "en", "sortBy": "publishedAt",
@@ -1185,23 +1192,24 @@ def get_news_sentiment(ticker: str, company_name: str = "") -> list[dict]:
             if r.get("status") == "ok":
                 for a in r.get("articles", [])[:10]:
                     pub_raw = a.get("publishedAt", "")
-                    # Compute hours_ago for breaking flag
                     hours_ago = None
                     try:
                         pub_dt = datetime.strptime(pub_raw[:19], "%Y-%m-%dT%H:%M:%S")
                         hours_ago = (now_utc - pub_dt).total_seconds() / 3600
-                    except: pass
+                    except (ValueError, TypeError):
+                        pass
                     arts.append({
-                        "title":       a.get("title", ""),
-                        "publisher":   a.get("source", {}).get("name", ""),
-                        "link":        a.get("url", ""),
-                        "published":   pub_raw[:10],
-                        "hours_ago":   hours_ago,
-                        "breaking":    hours_ago is not None and hours_ago < 12,
+                        "title":     a.get("title", ""),
+                        "publisher": a.get("source", {}).get("name", ""),
+                        "link":      a.get("url", ""),
+                        "published": pub_raw[:10],
+                        "hours_ago": hours_ago,
+                        "breaking":  hours_ago is not None and hours_ago < 12,
                     })
-        except: pass
+        except Exception as exc:
+            print(f"[NewsAPI error] {ticker}: {exc}")
 
-    # Fallback: FMP stock news (replaces yfinance.news — no rate-limit risk)
+    # Fallback: FMP stock news
     if not arts:
         try:
             news_data = _fmp_get("/stock_news", {"tickers": ticker, "limit": 10})
@@ -1212,7 +1220,7 @@ def get_news_sentiment(ticker: str, company_name: str = "") -> list[dict]:
                     try:
                         pub_dt    = datetime.strptime(pub_raw[:19], "%Y-%m-%dT%H:%M:%S")
                         hours_ago = (now_utc - pub_dt).total_seconds() / 3600
-                    except:
+                    except (ValueError, TypeError):
                         pass
                     arts.append({
                         "title":     item.get("title", "Market Update"),
@@ -1222,14 +1230,26 @@ def get_news_sentiment(ticker: str, company_name: str = "") -> list[dict]:
                         "hours_ago": hours_ago,
                         "breaking":  hours_ago is not None and hours_ago < 12,
                     })
-        except:
-            pass
+        except Exception as exc:
+            print(f"[FMP news error] {ticker}: {exc}")
 
-    # AI sentiment scoring
+    return arts
+
+
+def get_news_sentiment(ticker: str, company_name: str = "") -> list[dict]:
+    """
+    F-11: NOT cached — applies LLM sentiment scoring to the cached raw articles.
+    Keeping LLM calls outside @st.cache_data avoids the Streamlit serialisation
+    error that occurs when llm (a ChatGroq object) is referenced inside a cache.
+    The underlying HTTP fetch (_fetch_news_raw) is cached at 15 min.
+    """
+    arts = _fetch_news_raw(ticker, company_name)
+
     enriched: list[dict] = []
     for a in arts:
         if llm is None:
-            a["sentiment"] = "Neutral"; a["score"] = 0.5; a["reason"] = "AI unavailable (no GROQ_API_KEY)"
+            a["sentiment"] = "Neutral"; a["score"] = 0.5
+            a["reason"] = "AI unavailable (no GROQ_API_KEY)"
         else:
             try:
                 _p = ('Return ONLY valid JSON (no markdown, no backticks): '
@@ -1238,14 +1258,15 @@ def get_news_sentiment(ticker: str, company_name: str = "") -> list[dict]:
                 raw = llm.invoke(_p).content.strip().replace("```json","").replace("```","").strip()
                 d = json.loads(raw); s = d.get("sentiment","Neutral")
                 a["sentiment"] = s if s in ("Bullish","Bearish","Neutral") else "Neutral"
-                a["score"]     = float(d.get("score",0.5))
-                a["reason"]    = d.get("reason","")
-            except:
+                a["score"]     = float(d.get("score", 0.5))
+                a["reason"]    = d.get("reason", "")
+            except Exception as exc:
+                print(f"[LLM sentiment error] {ticker}: {exc}")
                 a["sentiment"] = "Neutral"; a["score"] = 0.5; a["reason"] = ""
         enriched.append(a)
 
     # Sort: breaking first, then by conviction
-    enriched.sort(key=lambda x: (not x.get("breaking",False), -abs(x.get("score",0.5)-0.5)))
+    enriched.sort(key=lambda x: (not x.get("breaking", False), -abs(x.get("score", 0.5)-0.5)))
     return enriched
 
 # ── Beta / correlation ────────────────────────────────────────────────────────
@@ -1648,9 +1669,11 @@ def page_analysis(run_analysis: bool) -> None:
         st.info("👈 Enter a ticker in the sidebar and click **🚀 RUN ANALYSIS** to begin.")
         return
 
-    # Cache-bust when ticker changes
+    # F-06: do NOT call st.cache_data.clear() here.
+    # That call wipes the entire application-level cache for ALL users and ALL
+    # tickers — including SPY benchmarks and sector ETF quotes — on every ticker
+    # change. Functions are keyed on ticker, so TTL-based expiry is sufficient.
     if ticker != st.session_state.get("last_ticker",""):
-        st.cache_data.clear()
         st.session_state["last_ticker"]    = ticker
         st.session_state["auto_peers"]     = []
         st.session_state["analysis_loaded"]= False
@@ -1931,15 +1954,33 @@ def page_analysis(run_analysis: bool) -> None:
                         hovertemplate="BB Lower: $%{y:.2f}<extra></extra>",
                     ), row=1, col=1)
                 if "VWAP" in chosen_inds and "Volume" in _disp_hist.columns:
-                    try:
-                        _tp  = (_disp_hist["High"] + _disp_hist["Low"] + _disp_hist["Close"]) / 3
-                        _vw  = (_tp * _disp_hist["Volume"]).cumsum() / _disp_hist["Volume"].cumsum()
-                        fig.add_trace(go.Scatter(
-                            x=_disp_hist.index, y=_vw, name="VWAP",
-                            line=dict(color="#a371f7", width=2),
-                            hovertemplate="VWAP: $%{y:.2f}<extra></extra>",
-                        ), row=1, col=1)
-                    except: pass
+                    # F-09: VWAP must reset at the start of each trading session.
+                    # The old cumsum() over the entire history window produces a
+                    # monotonically-converging value that institutional traders
+                    # do not recognise as VWAP.
+                    # On intraday frames (1D/5D) we compute a proper daily-reset VWAP.
+                    # On daily/weekly frames the metric is not meaningful — skip it
+                    # and show a note so users understand why it's absent.
+                    _is_intraday = _tf_interval in ("5m", "15m", "30m", "1h")
+                    if _is_intraday:
+                        try:
+                            _tp  = (_disp_hist["High"] + _disp_hist["Low"] + _disp_hist["Close"]) / 3
+                            _pv  = _tp * _disp_hist["Volume"]
+                            # group by calendar date, cumsum within each day
+                            _date_idx = _disp_hist.index.normalize()
+                            _cum_vol  = _disp_hist["Volume"].groupby(_date_idx).transform("cumsum")
+                            _cum_pv   = _pv.groupby(_date_idx).transform("cumsum")
+                            _vw = _cum_pv / _cum_vol
+                            fig.add_trace(go.Scatter(
+                                x=_disp_hist.index, y=_vw, name="VWAP",
+                                line=dict(color="#a371f7", width=2),
+                                hovertemplate="VWAP: $%{y:.2f}<extra></extra>",
+                            ), row=1, col=1)
+                        except Exception as _vwap_exc:
+                            print(f"[VWAP error] {ticker}: {_vwap_exc}")
+                    else:
+                        # VWAP is an intraday metric; silently skip on daily/weekly data
+                        pass
 
             if earnings:
                 try:
@@ -1963,14 +2004,22 @@ def page_analysis(run_analysis: bool) -> None:
 
             # ── ROWS 3 & 4: RSI + MACD (only when show_studies) ──────────────
             if show_studies and indicators:
-                _c   = _disp_hist["Close"]
-                _d   = _c.diff()
-                _ag  = _d.where(_d > 0, 0.0).ewm(alpha=1/14, adjust=False).mean()
-                _al  = (-_d.where(_d < 0, 0.0)).ewm(alpha=1/14, adjust=False).mean()
-                _rsi = 100 - (100 / (1 + _ag / _al.replace(0, float("nan"))))
+                # F-08: compute RSI and MACD on _rsi_hist (1Y daily, Wilder's EWM)
+                # — the same series used by calc_rsi_macd_bb() for the indicator
+                # panel.  Recomputing on _disp_hist (which may be weekly or intraday)
+                # produced different values, creating a visible mismatch between the
+                # RSI chart panel and the RSI tile below it.
+                _c_rsi = _rsi_hist["Close"] if not _rsi_hist.empty else _disp_hist["Close"]
+                _d_rsi = _c_rsi.diff()
+                _ag    = _d_rsi.where(_d_rsi > 0, 0.0).ewm(alpha=1/14, adjust=False).mean()
+                _al    = (-_d_rsi.where(_d_rsi < 0, 0.0)).ewm(alpha=1/14, adjust=False).mean()
+                _rsi_s = 100 - (100 / (1 + _ag / _al.replace(0, float("nan"))))
+                # Align RSI series to display history index (fill gaps with NaN)
+                _rsi_aligned = _rsi_s.reindex(_disp_hist.index, method="nearest",
+                                               tolerance=pd.Timedelta("3d"))
 
                 fig.add_trace(go.Scatter(
-                    x=_disp_hist.index, y=_rsi, name="RSI(14)",
+                    x=_disp_hist.index, y=_rsi_aligned, name="RSI(14)",
                     line=dict(color="#e3b341", width=1.8),
                     hovertemplate="RSI: %{y:.1f}<extra></extra>",
                 ), row=3, col=1)
@@ -1980,9 +2029,11 @@ def page_analysis(run_analysis: bool) -> None:
                 fig.add_hline(y=50, line_dash="dot", line_color="rgba(139,148,158,0.25)",line_width=1, row=3, col=1)
                 fig.add_hline(y=30, line_dash="dot", line_color="rgba(38,166,154,0.55)", line_width=1, row=3, col=1)
 
-                _e12   = _c.ewm(span=12, adjust=False).mean()
-                _e26   = _c.ewm(span=26, adjust=False).mean()
-                _macd  = _e12 - _e26
+                # MACD also on _rsi_hist for consistency
+                _e12   = _c_rsi.ewm(span=12, adjust=False).mean()
+                _e26   = _c_rsi.ewm(span=26, adjust=False).mean()
+                _macd  = (_e12 - _e26).reindex(_disp_hist.index, method="nearest",
+                                                tolerance=pd.Timedelta("3d"))
                 _msig  = _macd.ewm(span=9, adjust=False).mean()
                 _mhist = _macd - _msig
                 _mhcol = ["#26a69a" if v >= 0 else "#ef5350" for v in _mhist]
@@ -2271,8 +2322,13 @@ def page_analysis(run_analysis: bool) -> None:
                 def _simple_bt(h):
                     if len(h)<252: return None
                     cl=h["Close"].copy(); d=cl.diff()
-                    g=d.where(d>0,0).rolling(14).mean(); l=(-d.where(d<0,0)).rolling(14).mean()
-                    rsi=100-(100/(1+g/l)); sma=cl.rolling(200).mean()
+                    # F-21: use Wilder's EWM (alpha=1/14, adjust=False) — identical
+                    # to the indicator panel's calc_rsi_macd_bb().  The old
+                    # rolling(14).mean() (simple SMA) produces materially different
+                    # RSI values and causes signal mismatch between chart and backtest.
+                    g=d.where(d>0,0.0).ewm(alpha=1/14,adjust=False).mean()
+                    l=(-d.where(d<0,0.0)).ewm(alpha=1/14,adjust=False).mean()
+                    rsi=100-(100/(1+g/l.replace(0,float("nan")))); sma=cl.rolling(200).mean()
                     trades=[]; in_t=False; epx=0; eidx=0
                     for i in range(200,len(cl)):
                         if not in_t:
