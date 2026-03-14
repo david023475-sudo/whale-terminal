@@ -536,37 +536,113 @@ def _yf_info_to_dict(info: dict) -> dict:
         "_source": "Yahoo Finance",
     }
 
+# =============================================================================
+# FORWARD ESTIMATES — dedicated yfinance fetcher, called from ALL data paths
+# =============================================================================
+# Cache-bust mechanism: _DATA_VERSION is passed as _v to every cached function
+# whose return schema has changed. Incrementing it makes Streamlit treat the
+# call as a new cache key, immediately discarding stale entries without needing
+# st.cache_data.clear(). Bump this whenever forwardPE logic changes.
+_DATA_VERSION = 3
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _yf_forward_estimates(ticker: str, _v: int = _DATA_VERSION) -> dict:
+    """
+    Fetch ONLY forward-looking analyst estimates from yfinance.info.
+
+    This function is intentionally separated from get_stock_info so it runs
+    in BOTH the FMP path and the yfinance-fallback path. That guarantees
+    forwardPE and forwardEps are always sourced from Yahoo's analyst consensus,
+    regardless of which primary data path is active.
+
+    Source fields used:
+      forwardPE       — yf.info["forwardPE"]
+                        Yahoo computes this as currentPrice / forwardEps.
+                        Matches the "Forward P/E" shown on finance.yahoo.com.
+      forwardEps      — yf.info["forwardEps"]
+                        Yahoo's next-fiscal-year analyst mean EPS estimate.
+      targetMeanPrice — yf.info["targetMeanPrice"]
+                        Wall Street analyst consensus 12-month price target.
+
+    Returns {} on any failure. Callers treat absent keys as None.
+
+    NEVER aliases trailing P/E, TTM P/E, or historical diluted EPS here.
+    """
+    if not _YF_AVAILABLE:
+        return {}
+    try:
+        raw = yf.Ticker(ticker).info or {}
+        result: dict = {}
+
+        # forwardPE: positive and < 10000 guard — negative means loss-making,
+        # absurdly large is a data artefact. Both should display as N/A.
+        fpe = raw.get("forwardPE")
+        try:
+            v = float(fpe) if fpe is not None else None
+            result["forwardPE"] = v if (v is not None and 0 < v < 10_000) else None
+        except (TypeError, ValueError):
+            result["forwardPE"] = None
+
+        # forwardEps: no sanity range — negative is valid for loss-making companies.
+        feps = raw.get("forwardEps")
+        try:
+            result["forwardEps"] = float(feps) if feps is not None else None
+        except (TypeError, ValueError):
+            result["forwardEps"] = None
+
+        # targetMeanPrice: analyst mean 12-month price target.
+        tgt = raw.get("targetMeanPrice")
+        try:
+            result["targetMeanPrice"] = float(tgt) if tgt is not None else None
+        except (TypeError, ValueError):
+            result["targetMeanPrice"] = None
+
+        return result
+    except Exception as exc:
+        print(f"[_yf_forward_estimates error] {ticker}: {exc}")
+        return {}
+
+
 # ── Stock info ────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=900, show_spinner=False)
-def get_stock_info(ticker: str) -> dict:
+def get_stock_info(ticker: str, _v: int = _DATA_VERSION) -> dict:
     """
-    Fetch full company fundamentals. FMP is primary; yfinance is the automatic
-    silent fallback if FMP returns a 403 or plan/legacy error.
+    Fetch full company fundamentals.
 
-    FMP endpoints (non-legacy, available to all account tiers):
-      /profile, /quote, /ratios, /key-metrics, /income-statement,
-      /balance-sheet-statement
+    FMP is primary for balance-sheet / income / ratio data.
+    yfinance is the silent fallback when FMP is blocked.
 
-    Yahoo Finance fallback:
-      yf.Ticker(ticker).info — provides the same key schema via _yf_info_to_dict
+    Forward-looking fields (forwardPE, forwardEps, targetMeanPrice) are sourced
+    from _yf_forward_estimates() in BOTH paths — never from FMP fields that
+    carry trailing or model-derived values.
+
+    Cache-bust: _v=_DATA_VERSION so incrementing _DATA_VERSION immediately
+    invalidates stale cache entries without a server restart.
     """
     def _f(v):
         try: return float(v) if v is not None else None
-        except: return None
-    _r = _f  # /ratios returns 0-1 decimals already
+        except (TypeError, ValueError): return None
+    _r = _f
+
+    # Always fetch true forward estimates first, outside FMP/fallback branching.
+    _fwd = _yf_forward_estimates(ticker)
 
     # ── 1. FMP profile — the gating call ─────────────────────────────────────
     profile_data = _fmp_get(f"/profile/{ticker}", _ui_errors=True)
     if profile_data is _FMP_BLOCKED:
-        # FMP blocked → fall silently to Yahoo Finance
         print(f"[Fallback] get_stock_info({ticker}) → Yahoo Finance")
         st.info(f"ℹ️ Using backup data source for {ticker}", icon="ℹ️")
         try:
             info = yf.Ticker(ticker).info
             if not info or not info.get("symbol"):
-                st.error(f"❌ Could not fetch data for **{ticker}** from either FMP or Yahoo Finance.")
+                st.error(f"❌ Could not fetch data for **{ticker}** from either source.")
                 return {}
-            return _yf_info_to_dict(info)
+            result = _yf_info_to_dict(info)
+            # Overwrite forward fields with the dedicated fetcher's validated values.
+            result["forwardPE"]       = _fwd.get("forwardPE")
+            result["forwardEps"]      = _fwd.get("forwardEps")
+            result["targetMeanPrice"] = _fwd.get("targetMeanPrice")
+            return result
         except Exception as exc:
             st.error(f"❌ Yahoo Finance fallback also failed for **{ticker}**: {exc}")
             return {}
@@ -597,7 +673,7 @@ def get_stock_info(ticker: str) -> dict:
     if km_data and km_data is not _FMP_BLOCKED and isinstance(km_data, list):
         km = km_data[0]
 
-    # ── 5. Income statement (two rows for YoY growth) ─────────────────────────
+    # ── 5. Income statement (two rows for YoY EPS growth) ────────────────────
     inc: dict = {}
     _rev_growth = _eps_growth = None
     inc_data = _fmp_get(f"/income-statement/{ticker}", {"period": "annual", "limit": 2})
@@ -606,9 +682,6 @@ def get_stock_info(ticker: str) -> dict:
         if len(inc_data) >= 2:
             rev0 = float(inc_data[0].get("revenue") or 0)
             rev1 = float(inc_data[1].get("revenue") or 0)
-            # F-04: use diluted EPS growth, not net income growth.
-            # Net income is affected by share buybacks and one-off items;
-            # EPS growth is what drives P/E-based valuation and PEG ratio.
             eps0 = float(inc_data[0].get("epsdiluted") or 0)
             eps1 = float(inc_data[1].get("epsdiluted") or 0)
             _rev_growth = (rev0 - rev1) / abs(rev1) if rev1 else None
@@ -620,7 +693,7 @@ def get_stock_info(ticker: str) -> dict:
     if bs_data and bs_data is not _FMP_BLOCKED and isinstance(bs_data, list):
         bs = bs_data[0]
 
-    # ── 7. Cash flow statement (F-05: direct FCF, not per-share reconstruction) ─
+    # ── 7. Cash flow statement ────────────────────────────────────────────────
     cf: dict = {}
     cf_data = _fmp_get(f"/cash-flow-statement/{ticker}", {"period": "annual", "limit": 1})
     if cf_data and cf_data is not _FMP_BLOCKED and isinstance(cf_data, list):
@@ -642,10 +715,8 @@ def get_stock_info(ticker: str) -> dict:
             except (ValueError, IndexError):
                 pass
 
-    # F-05: FCF fallback order:
-    #   1. /cash-flow-statement freeCashFlow  (direct — most accurate)
-    #   2. fcf_per_share × sharesOutstanding  (only if shares are from profile/key-metrics)
-    #   3. None — never use balance-sheet commonStock as a share count
+    # FCF: direct from cash flow statement; fallback to per-share × shares.
+    # Never use balance-sheet commonStock as a share count.
     _fcf = _f(cf.get("freeCashFlow"))
     if _fcf is None:
         _fcf_ps = _f(ra.get("freeCashFlowPerShareTTM") or ra.get("freeCashFlowPerShare"))
@@ -653,7 +724,6 @@ def get_stock_info(ticker: str) -> dict:
                    or _f(p.get("sharesOutstanding")))
         if _fcf_ps is not None and _shares and _shares > 0:
             _fcf = _fcf_ps * _shares
-        # else: remains None — do not fabricate from balance-sheet commonStock
 
     return {
         "symbol":   p.get("symbol"),
@@ -675,25 +745,20 @@ def get_stock_info(ticker: str) -> dict:
         "fiftyTwoWeekHigh": wk52_high,
         "fiftyTwoWeekLow":  wk52_low,
         "trailingPE":  _r(ra.get("priceEarningsRatioTTM") or ra.get("priceEarningsRatio")),
-        # F-01: forwardPE — FMP free tier does not expose true NTM P/E.
-        # Returning None so the UI shows N/A rather than the TTM alias.
-        # The yfinance fallback path (_yf_info_to_dict) correctly reads
-        # info["forwardPE"] which Yahoo derives from next-year EPS estimates.
-        "forwardPE":   None,
+        # forwardPE: always from _yf_forward_estimates (yf.info["forwardPE"]).
+        # FMP ratios contain only TTM data on the free tier; never use them here.
+        "forwardPE":   _fwd.get("forwardPE"),
         "pegRatio":    _r(km.get("pegRatio")),
         "priceToSalesTrailing12Months": _r(ra.get("priceToSalesRatioTTM") or ra.get("priceToSalesRatio")),
         "priceToBook": _r(ra.get("priceToBookRatioTTM") or ra.get("priceToBookRatio")),
         "enterpriseToEbitda":  _r(km.get("enterpriseValueOverEBITDA")),
         "enterpriseToRevenue": _r(km.get("evToSales")),
-        "trailingEps":     _f(inc.get("epsdiluted") or p.get("eps")),
-        # F-02: forwardEps — epsdiluted is the most-recent historical reported EPS,
-        # not a forward estimate. FMP free tier has no analyst EPS estimates endpoint.
-        # Returning None; yfinance fallback reads info["forwardEps"] (true NTM estimate).
-        "forwardEps":      None,
-        # F-03: targetMeanPrice — p.get("dcf") is FMP's own automated DCF model,
-        # NOT Wall Street analyst consensus. These are fundamentally different data
-        # points. Returning None; yfinance reads info["targetMeanPrice"] (true consensus).
-        "targetMeanPrice": None,
+        "trailingEps": _f(inc.get("epsdiluted") or p.get("eps")),
+        # forwardEps: always from _yf_forward_estimates (yf.info["forwardEps"]).
+        "forwardEps":      _fwd.get("forwardEps"),
+        # targetMeanPrice: always from _yf_forward_estimates (yf.info["targetMeanPrice"]).
+        # FMP profile["dcf"] is FMP's own model estimate, not analyst consensus.
+        "targetMeanPrice": _fwd.get("targetMeanPrice"),
         "profitMargins":    _r(ra.get("netProfitMarginTTM")       or ra.get("netProfitMargin")),
         "operatingMargins": _r(ra.get("operatingProfitMarginTTM") or ra.get("operatingProfitMargin")),
         "grossMargins":     _r(ra.get("grossProfitMarginTTM")     or ra.get("grossProfitMargin")),
@@ -705,14 +770,13 @@ def get_stock_info(ticker: str) -> dict:
         "quickRatio":   _r(ra.get("quickRatioTTM")          or ra.get("quickRatio")),
         "currentRatio": _r(ra.get("currentRatioTTM")        or ra.get("currentRatio")),
         "bookValue":    _f(km.get("bookValuePerShare")),
-        "freeCashflow":      _fcf,   # F-05: from cash flow statement, see fallback logic above
+        "freeCashflow":      _fcf,
         "operatingCashflow": _f(cf.get("operatingCashFlow") or inc.get("operatingCashFlow")),
         "totalRevenue":    _f(inc.get("revenue")    or p.get("revenue")),
         "ebitda":          _f(inc.get("ebitda")),
         "netIncomeToCommon": _f(inc.get("netIncome")),
         "revenuePerShare": _f(km.get("revenuePerShare")),
         "revenueGrowth":   _rev_growth,
-        # F-04: earningsGrowth now uses diluted EPS YoY, not net income YoY
         "earningsGrowth":  _eps_growth,
         "quarterlyRevenueGrowth": _rev_growth,
         "sharesOutstanding": _f(p.get("sharesOutstanding") or km.get("weightedAverageSharesOutstanding")),
