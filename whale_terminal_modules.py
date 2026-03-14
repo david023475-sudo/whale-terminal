@@ -11,22 +11,6 @@ try:
     _YF_AVAILABLE = True
 except ImportError:
     _YF_AVAILABLE = False
-
-# ── yahooquery — richer fundamentals, analyst estimates ──────────────────────
-try:
-    from yahooquery import Ticker as YQTicker
-    _YQ_AVAILABLE = True
-except ImportError:
-    _YQ_AVAILABLE = False
-    YQTicker = None  # type: ignore
-
-# ── yahoo_fin — lightweight fallback ─────────────────────────────────────────
-try:
-    import yahoo_fin.stock_info as _yf_fin
-    _YFIN_AVAILABLE = True
-except ImportError:
-    _YFIN_AVAILABLE = False
-    _yf_fin = None  # type: ignore
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -49,13 +33,16 @@ SECTOR_COLORS = {
 }
 # Sentinel: FMP returned a plan/legacy block (not an empty/missing result).
 # _fmp_get returns this object; callers test `result is _FMP_BLOCKED`.
+# SINGLE SOURCE OF TRUTH — app.py must import this, not redefine its own.
+# Two separate singletons in two modules compare unequal under `is`, which
+# silently breaks every blocked-response guard in get_stock_info.
 class _Blocked:
     _inst = None
     def __new__(cls):
         if cls._inst is None: cls._inst = super().__new__(cls)
         return cls._inst
     def __repr__(self): return "<FMP_BLOCKED>"
-_FMP_BLOCKED = _Blocked()
+_FMP_BLOCKED = _Blocked()   # ← canonical instance; imported by app.py
 
 FMP_BASE = "https://financialmodelingprep.com/api/v3"
 
@@ -203,14 +190,14 @@ INDUSTRY_PEERS: dict[str, list[str]] = {
     "Software—Infrastructure": ["MSFT","ORCL","IBM","SAP","NOW","SNOW","DDOG"],
     "Software—Application": ["ADBE","CRM","INTU","WDAY","HUBS","VEEV","ZM"],
     "Consumer Electronics": ["AAPL","SONY","DELL","HPQ","LOGI"],
-    "Internet Content & Information": ["GOOGL","META","SNAP","PINS","TWTR","RDDT"],
+    "Internet Content & Information": ["GOOGL","META","SNAP","PINS","RDDT"],
     "Auto Manufacturers": ["TSLA","TM","GM","F","RIVN","NIO","STLA"],
     "Biotechnology": ["AMGN","GILD","BIIB","REGN","VRTX","MRNA","BNTX"],
     "Drug Manufacturers": ["PFE","MRK","ABBV","LLY","JNJ","BMY","RHHBY"],
     "Banks—Diversified": ["JPM","BAC","WFC","C","GS","MS","USB"],
     "Insurance": ["BRK-B","MET","PRU","AIG","TRV","ALL","PGR"],
     "Oil & Gas E&P": ["XOM","CVX","COP","OXY","EOG","PXD","DVN"],
-    "Airlines": ["DAL","UAL","AAL","LUV","JBLU","SAVE","ALK"],
+    "Airlines": ["DAL","UAL","AAL","LUV","JBLU","ALK"],
     "Retail": ["AMZN","WMT","TGT","COST","HD","LOW","TJX"],
     "Restaurants": ["MCD","SBUX","CMG","YUM","QSR","DPZ","WEN"],
 }
@@ -287,8 +274,11 @@ class AuthManager:
         st.session_state["wt_authed"] = True
 
     def _demo_login(self, email):
-        import hashlib
-        fid = hashlib.md5(email.encode()).hexdigest()
+        import uuid
+        # uuid5 with a fixed namespace gives a deterministic, collision-resistant
+        # session ID from the email string — no cryptographic security claim,
+        # purely a stable identifier for session-only demo mode.
+        fid = str(uuid.uuid5(uuid.NAMESPACE_X500, email))
         st.session_state["wt_user"] = {"id":fid,"email":email,"access_token":"","refresh_token":""}
         st.session_state["wt_authed"] = True
         return True, f"Demo mode: signed in as {email} (session-only)."
@@ -634,13 +624,19 @@ class PortfolioManager:
         try:
             spy = self._hist_close("SPY", period)
             if spy is None: return None
-            tc = sum(float(p["buy_price"])*float(p["quantity"]) for p in positions)
+            # F-22 fix: weight by current market value (qty × live price), not cost basis.
+            # Cost-basis weighting understates positions that have appreciated significantly,
+            # producing an incorrect benchmark comparison for long-held positions.
+            live_prices = {p["ticker"]: (self._live(p["ticker"]) or float(p["buy_price"]))
+                           for p in positions}
+            tc = sum(live_prices[p["ticker"]] * float(p["quantity"]) for p in positions)
             if tc <= 0: return None
             pr = pd.Series(0.0, index=spy.index)
             for p in positions:
                 cl = self._hist_close(p["ticker"], period)
                 if cl is None: continue
-                w = (float(p["buy_price"])*float(p["quantity"])) / tc
+                # weight = current market value of this position / total portfolio value
+                w = (live_prices[p["ticker"]] * float(p["quantity"])) / tc
                 aligned = cl.reindex(spy.index, method="ffill")
                 pr = pr.add((aligned/aligned.iloc[0]-1)*100*w, fill_value=0)
             sr = (spy/spy.iloc[0]-1)*100
